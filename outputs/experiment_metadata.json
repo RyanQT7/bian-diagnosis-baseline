@@ -1,0 +1,9 @@
+{
+  "model": "DeepSeek-R1-Distill-Qwen-32B",
+  "load_seconds": 255.67385569401085,
+  "n_cases": 608,
+  "stage1_cases": 608,
+  "stage2_cases": 608,
+  "model_calls": 1824,
+  "retries": 1171
+}

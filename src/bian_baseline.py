@@ -73,6 +73,35 @@ STAGE2_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+V2_STAGE1_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "evidence_summary": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "class_scores": {
+            "type": "object",
+            "properties": {label: {"type": "number"} for label in LABELS},
+            "required": list(LABELS),
+            "additionalProperties": False,
+        },
+        "ranked_diagnoses": {"type": "array", "items": {"type": "string", "enum": list(LABELS)}},
+    },
+    "required": ["evidence_summary", "reasoning", "class_scores", "ranked_diagnoses"],
+    "additionalProperties": False,
+}
+
+V2_STAGE2_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "diagnosis_root_cause": {"type": "string", "enum": list(LABELS)},
+        "confidence": {"type": "number"},
+        "evidence_summary": {"type": "string"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["diagnosis_root_cause", "confidence", "evidence_summary", "reasoning"],
+    "additionalProperties": False,
+}
+
 
 def _number(value: Any) -> float | None:
     if isinstance(value, bool):
@@ -431,17 +460,61 @@ def _stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
     )
 
 
+def _stage1_prompt_v2(summary: dict[str, Any]) -> str:
+    return (
+        "Stage 1: diagnose one network case as remote, local, or fiber using only the observable summary. "
+        "Compare location/side asymmetry, temporal delta/slope, optical power/SNR/transmission coupling, and status alarms. "
+        "Remote means evidence centered beyond the local endpoint; local means endpoint-local behavior; fiber means path/media evidence. "
+        "Do not invent data. Keep evidence_summary and reasoning concise (at most 40 words each). Return JSON only with "
+        "evidence_summary, reasoning, class_scores {remote,local,fiber}, and ranked_diagnoses containing each class once.\n"
+        "OBSERVATIONS:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _stage2_prompt_v2(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
+    return (
+        "Stage 2: independently verify the Stage 1 ranking against the observable summary, then choose exactly remote, local, or fiber. "
+        "Prioritize consistent cross-metric, side/location, and temporal evidence; do not use filenames or hidden labels. "
+        "Keep evidence_summary and reasoning concise (at most 40 words each). Return JSON only with diagnosis_root_cause, "
+        "confidence, evidence_summary, reasoning.\nSTAGE1:\n" +
+        json.dumps(stage1, ensure_ascii=False, separators=(",", ":")) +
+        "\nOBSERVATIONS:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _valid_stage1_v2(value: Any, fallback: list[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return _valid_stage1(value, fallback)
+    raw_scores = value.get("class_scores", {}) if isinstance(value.get("class_scores"), dict) else {}
+    scores = {label: float(raw_scores.get(label, 0.0)) for label in LABELS}
+    ranking = [item for item in value.get("ranked_diagnoses", []) if item in LABELS] if isinstance(value.get("ranked_diagnoses"), list) else []
+    ranking = list(dict.fromkeys(ranking))
+    ranking.extend(label for label in sorted(LABELS, key=lambda item: (-scores[item], item)) if label not in ranking)
+    return {
+        "evidence_summary": str(value.get("evidence_summary", "")),
+        "reasoning": str(value.get("reasoning", "")),
+        "hypotheses": {label: {"confidence": scores[label], "evidence": []} for label in LABELS},
+        "ranked_diagnoses": ranking[:3] if ranking else fallback,
+    }
+
+
 def run(args: argparse.Namespace) -> int:
     cases = load_cases(args.data_root)
     if not args.model_path.is_dir():
         raise ValueError(f"model path does not exist: {args.model_path}")
     backend = Local32BBackend(args.model_path, args.gpu_ids, args.seed, args.max_input_tokens, args.max_output_tokens, args.max_num_seqs)
+    is_v2 = args.prompt_version == "v2"
+    stage1_prompt = _stage1_prompt_v2 if is_v2 else _stage1_prompt
+    stage2_prompt = _stage2_prompt_v2 if is_v2 else _stage2_prompt
+    stage1_schema = V2_STAGE1_SCHEMA if is_v2 else STAGE1_SCHEMA
+    stage2_schema = V2_STAGE2_SCHEMA if is_v2 else STAGE2_SCHEMA
+    stage1_validator = _valid_stage1_v2 if is_v2 else _valid_stage1
     if args.smoke_test:
         smoke_case = cases[0]
         summary = summarize_observations(smoke_case["data"])
-        stage1_raw = backend.generate_json([{"prompt": _stage1_prompt(summary), "schema": STAGE1_SCHEMA}])[0]
-        stage1 = _valid_stage1(stage1_raw["value"], _fallback_ranking(summary))
-        stage2_raw = backend.generate_json([{"prompt": _stage2_prompt(summary, stage1), "schema": STAGE2_SCHEMA}])[0]
+        stage1_raw = backend.generate_json([{"prompt": stage1_prompt(summary), "schema": stage1_schema}])[0]
+        stage1 = stage1_validator(stage1_raw["value"], _fallback_ranking(summary))
+        stage2_raw = backend.generate_json([{"prompt": stage2_prompt(summary, stage1), "schema": stage2_schema}])[0]
         stage2 = _valid_stage2(stage2_raw["value"], stage1["ranked_diagnoses"][0])
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "smoke_test.json").write_text(json.dumps({"model": "DeepSeek-R1-Distill-Qwen-32B", "stage1": stage1, "stage2": stage2, "calls": backend.call_count}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -449,10 +522,10 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     summaries = [summarize_observations(case["data"]) for case in cases]
-    stage1_requests = [{"prompt": _stage1_prompt(summary), "schema": STAGE1_SCHEMA} for summary in summaries]
+    stage1_requests = [{"prompt": stage1_prompt(summary), "schema": stage1_schema} for summary in summaries]
     stage1_raw = backend.generate_json(stage1_requests)
-    stage1_values = [_valid_stage1(item["value"], _fallback_ranking(summary)) for item, summary in zip(stage1_raw, summaries)]
-    stage2_requests = [{"prompt": _stage2_prompt(summary, stage1), "schema": STAGE2_SCHEMA} for summary, stage1 in zip(summaries, stage1_values)]
+    stage1_values = [stage1_validator(item["value"], _fallback_ranking(summary)) for item, summary in zip(stage1_raw, summaries)]
+    stage2_requests = [{"prompt": stage2_prompt(summary, stage1), "schema": stage2_schema} for summary, stage1 in zip(summaries, stage1_values)]
     stage2_raw = backend.generate_json(stage2_requests)
     final_values = [_valid_stage2(item["value"], stage1["ranked_diagnoses"][0]) for item, stage1 in zip(stage2_raw, stage1_values)]
 
@@ -472,6 +545,7 @@ def run(args: argparse.Namespace) -> int:
         })
     audit = {
         "model": "DeepSeek-R1-Distill-Qwen-32B",
+        "prompt_version": args.prompt_version,
         "stages": {"stage1_cases": len(stage1_values), "stage2_cases": len(final_values), "model_calls": backend.call_count, "retries": backend.retry_count},
         "cases": audit_cases,
     }
@@ -485,7 +559,7 @@ def run(args: argparse.Namespace) -> int:
         raise AssertionError("invalid BiAn result frame")
     frame.to_csv(args.output_dir / "bian_results.csv", index=False)
     (args.output_dir / "scores.txt").write_text(score_frame(frame), encoding="utf-8")
-    (args.output_dir / "experiment_metadata.json").write_text(json.dumps({"model": "DeepSeek-R1-Distill-Qwen-32B", "load_seconds": backend.load_seconds, "n_cases": len(cases), "stage1_cases": len(stage1_values), "stage2_cases": len(final_values), "model_calls": backend.call_count, "retries": backend.retry_count}, indent=2) + "\n", encoding="utf-8")
+    (args.output_dir / "experiment_metadata.json").write_text(json.dumps({"model": "DeepSeek-R1-Distill-Qwen-32B", "prompt_version": args.prompt_version, "load_seconds": backend.load_seconds, "n_cases": len(cases), "stage1_cases": len(stage1_values), "stage2_cases": len(final_values), "model_calls": backend.call_count, "retries": backend.retry_count}, indent=2) + "\n", encoding="utf-8")
     print(f"BiAn complete: {len(frame)} cases; model calls={backend.call_count}")
     print((args.output_dir / "scores.txt").read_text(encoding="utf-8"))
     return 0
@@ -501,6 +575,7 @@ def main() -> int:
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--max-output-tokens", type=int, default=256)
     parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument("--prompt-version", choices=("v1", "v2"), default="v1")
     parser.add_argument("--smoke-test", action="store_true")
     return run(parser.parse_args())
 

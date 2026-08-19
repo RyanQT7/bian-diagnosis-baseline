@@ -20,6 +20,16 @@ python3 run_experiment.py \
   --gpu-ids 4,5
 ```
 
+The optional compact v2 prompt/schema experiment is run without overwriting
+v1:
+
+```bash
+python3 run_experiment.py --data-root /path/to/data \
+  --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
+  --gpu-ids 4,5 --prompt-version v2 --max-output-tokens 160 \
+  --output-dir outputs/v2
+```
+
 Run the required small load-and-generation check first:
 
 ```bash
@@ -54,6 +64,14 @@ ranking. Stage 2 receives that structured analysis plus the observable
 summary and produces the final diagnosis. vLLM guided JSON decoding, greedy
 generation, bounded retry, JSON extraction, and an observation-only
 deterministic fallback keep the final output within the three-class contract.
+
+`outputs/v1/` preserves the original run. Version 2 uses a shorter Stage 1
+representation and an xgrammar-compatible schema, reducing final parse errors
+and runtime. On the complete experiment, however, v2
+Accuracy/Macro-F1 (`0.337171/0.270924`) did not improve on v1
+(`0.463816/0.274348`), so v1 remains the recommended result and the root
+`outputs/bian_results.csv` is intentionally unchanged. The v2 results remain
+available under `outputs/v2/` for reproducibility.
 
 This is a current-dataset adaptation: the data, three-way case task, labels,
 prompts, and 32B model differ from the original paper and from the read-only

@@ -1,0 +1,17 @@
+data/
+pretrained_models/
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+tmp/
+cache/
+outputs/.cache/

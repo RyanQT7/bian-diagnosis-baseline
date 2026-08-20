@@ -18,21 +18,14 @@ from llm_backend import Local32BBackend, numeric_leaves, status_number
 METRICS = ("bias", "rxpower", "txpower", "media_snr", "host_snr", "serdes_snr")
 STATUS_FIELDS = ("RxLOL", "TxLOL", "TxLOS", "RxLOS")
 ENDPOINT_KEY_FIELDS = METRICS + STATUS_FIELDS + ("vendor", "vendor_sn", "Temperature", "Voltage")
-REFERENCE_THRESHOLDS = {
-    "rxpower": {"lane_down": -40.0, "low": -2.5, "high": 4.6, "lane_diff": 1.0},
-    "txpower": {"lane_down": -40.0, "low": -2.5, "high": 2.5, "lane_diff": 1.3},
-    "host_snr": {"lane_down": 0.0, "low": 22.8, "high": 27.5, "lane_diff": 2.5},
-    "media_snr": {"lane_down": 0.0, "low": 22.4, "high": 28.7, "lane_diff": 3.0},
-    "serdes_snr": {"lane_down": 0.0, "low": 458750.0, "high": 947750.0, "lane_diff": 230000.0},
-}
-
-SOP_SOFT_PRIOR = """EXPERT SOP SOFT PRIORS (not mandatory rules):
-- host_snr and serdes_snr abnormalities usually support the same endpoint.
-- media_snr and rxpower abnormalities usually support the opposite endpoint.
-- txpower abnormality, especially lane-down/extreme loss, strongly supports the same endpoint.
-- combined serdes_snr + media_snr + rxpower anomalies require severity, lanes, time, and other metrics; when coherent they can strongly support the opposite endpoint.
-- strong bilateral, similarly severe, directionally conflicting evidence increases fiber evidence; bilateral asymmetry favors the stronger coherent endpoint.
-Apply same/opposite relative to the actual endpoint identifier where each anomaly occurs. Historical threshold flags are reference-only. Never turn these priors into a decision tree or infer a diagnosis from interface rate."""
+SOP_SOFT_PRIOR = """WEAK EXPERT BACKGROUND (optional, possibly inaccurate):
+- host_snr abnormalities may provide evidence about the endpoint itself.
+- serdes_snr abnormalities may provide evidence about endpoint-side impairment.
+- media_snr abnormalities may reflect endpoint or transmission-path degradation.
+- rxpower abnormalities may originate from transmitter, receiver, optical module, lane, or fiber/path impairment.
+- txpower abnormalities may provide evidence about the transmitting endpoint.
+- combinations of metrics can be more informative than any single metric, but interpretation must come from the complete case.
+This weak prior may be incomplete, dataset-specific, or inaccurate. Never apply a fixed same/opposite mapping, threshold rule, or implicit decision tree."""
 
 
 def _prediction_cases(data_root: Path) -> list[dict[str, Any]]:
@@ -82,7 +75,7 @@ def _metric_summary(raw: Any, metric: str) -> dict[str, Any]:
     lane_means = {lane: float(np.mean(values)) for lane, values in lanes.items() if values}
     values = [value for lane in lanes.values() for value in lane]
     if not values:
-        return {"available": False, "state_candidates": ["uncertain"]}
+        return {"available": False}
     array = np.asarray(values, dtype=float)
     deltas = [lane[-1] - lane[0] for lane in lanes.values() if len(lane) > 1]
     lane_diff = max(lane_means.values()) - min(lane_means.values()) if len(lane_means) > 1 else 0.0
@@ -92,24 +85,10 @@ def _metric_summary(raw: Any, metric: str) -> dict[str, Any]:
         "mean": round(float(np.mean(array)), 6), "median": round(float(np.median(array)), 6),
         "std": round(float(np.std(array)), 6), "min": round(float(np.min(array)), 6),
         "max": round(float(np.max(array)), 6), "lane_difference": round(float(lane_diff), 6),
+        "sample_count": int(len(array)),
         "temporal_mean_delta": round(float(np.mean(deltas)), 6) if deltas else None,
         "temporal_max_abs_delta": round(float(max(map(abs, deltas))), 6) if deltas else None,
     }
-    states: list[str] = []
-    flags: list[str] = []
-    reference = REFERENCE_THRESHOLDS.get(metric)
-    if reference:
-        checks = (
-            (any(v <= reference["lane_down"] for v in lane_means.values()), "lane_down", "at_or_below_lane_down_reference"),
-            (any(v < reference["low"] for v in lane_means.values()), "low_value", "below_low_reference"),
-            (any(v > reference["high"] for v in lane_means.values()), "high_value", "above_high_reference"),
-            (lane_diff > reference["lane_diff"], "lane_difference", "above_lane_difference_reference"),
-        )
-        for matched, state, flag in checks:
-            if matched:
-                states.append(state); flags.append(flag)
-    result["state_candidates"] = states or ["normal_or_uncertain"]
-    result["reference_threshold_flag"] = {"scope": "expert_reference_only", "flags": flags}
     return result
 
 
@@ -126,7 +105,14 @@ def summarize_case(data: dict[str, Any]) -> dict[str, Any]:
     alarm_interface = data.get("alarm_ip_interface")
     alarm_endpoint = next((endpoint for endpoint in endpoints if mapping.get(endpoint) == alarm_interface), None)
     metadata = {
-        endpoint: {"interface": mapping.get(endpoint), "rate_is_metadata_only": True}
+        endpoint: {
+            "interface": mapping.get(endpoint),
+            "interface_metadata_does_not_define_label": True,
+            "vendor": data.get("vendor", {}).get(endpoint) if isinstance(data.get("vendor"), dict) else None,
+            "vendor_sn": data.get("vendor_sn", {}).get(endpoint) if isinstance(data.get("vendor_sn"), dict) else None,
+            "temperature": _metric_summary(data.get("Temperature", {}).get(endpoint) if isinstance(data.get("Temperature"), dict) else None, "Temperature"),
+            "voltage": _metric_summary(data.get("Voltage", {}).get(endpoint) if isinstance(data.get("Voltage"), dict) else None, "Voltage"),
+        }
         for endpoint in endpoints
     }
     evidence: dict[str, Any] = {}
@@ -168,38 +154,49 @@ def summarize_case(data: dict[str, Any]) -> dict[str, Any]:
         "endpoint_evidence": evidence,
         "transmission_by_native_direction": transmission,
         "cross_endpoint_comparison": cross,
-        "threshold_note": "reference flags are expert_reference_only and cannot directly determine diagnosis",
+        "summary_contract": "objective values and statistics only; no SOP threshold flags or rule-derived anomaly labels",
     }
 
 
 def _stage1_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
-    candidates = [*endpoints, "fiber"]
     return {
         "type": "object",
         "properties": {
-            "endpoint_evidence": {"type": "array", "items": {"type": "object", "properties": {"endpoint": {"type": "string", "enum": list(endpoints)}, "evidence": {"type": "string"}}, "required": ["endpoint", "evidence"], "additionalProperties": False}},
-            "lane_temporal_findings": {"type": "string"},
-            "transmission_findings": {"type": "string"},
-            "cross_endpoint_comparison": {"type": "string"},
-            "directional_evidence": {"type": "array", "items": {"type": "object", "properties": {"diagnosis": {"type": "string", "enum": candidates}, "evidence": {"type": "string"}}, "required": ["diagnosis", "evidence"], "additionalProperties": False}},
-            "conflicting_evidence": {"type": "string"},
-            "preliminary_diagnosis": {"type": "string", "enum": candidates},
+            "endpoint_facts": {"type": "object", "properties": {endpoint: {"type": "string"} for endpoint in endpoints}, "required": list(endpoints), "additionalProperties": False},
+            "lane_facts": {"type": "string"},
+            "transmission_facts": {"type": "string"},
+            "status_and_metadata_facts": {"type": "string"},
+            "cross_endpoint_facts": {"type": "string"},
+            "data_limitations": {"type": "string"},
+            "possible_interpretations": {"type": "string"},
         },
-        "required": ["endpoint_evidence", "lane_temporal_findings", "transmission_findings", "cross_endpoint_comparison", "directional_evidence", "conflicting_evidence", "preliminary_diagnosis"],
+        "required": ["endpoint_facts", "lane_facts", "transmission_facts", "status_and_metadata_facts", "cross_endpoint_facts", "data_limitations", "possible_interpretations"],
         "additionalProperties": False,
     }
 
 
 def _stage2_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+    candidates = [*endpoints, "fiber"]
+    assessment = {
+        "type": "object",
+        "properties": {
+            "supporting": {"type": "string"},
+            "contradictory": {"type": "string"},
+            "unexplained": {"type": "string"},
+        },
+        "required": ["supporting", "contradictory", "unexplained"],
+        "additionalProperties": False,
+    }
     return {
         "type": "object",
         "properties": {
-            "diagnosis_root_cause": {"type": "string", "enum": [*endpoints, "fiber"]},
+            "hypothesis_assessments": {"type": "object", "properties": {candidate: assessment for candidate in candidates}, "required": candidates, "additionalProperties": False},
+            "ignored_expert_prior": {"type": "string"},
+            "diagnosis_root_cause": {"type": "string", "enum": candidates},
             "confidence": {"type": "number"},
-            "evidence_summary": {"type": "string"},
             "reasoning": {"type": "string"},
         },
-        "required": ["diagnosis_root_cause", "confidence", "evidence_summary", "reasoning"],
+        "required": ["hypothesis_assessments", "ignored_expert_prior", "diagnosis_root_cause", "confidence", "reasoning"],
         "additionalProperties": False,
     }
 
@@ -209,9 +206,10 @@ def _stage1_prompt(summary: dict[str, Any]) -> str:
     return (
         "BiAn Stage 1: extract physical evidence using the native endpoint identifiers exactly as provided. "
         f"Candidate diagnoses for THIS case: {candidates}. Do not rename endpoints as local, remote, side_a, or side_b. "
-        "For every endpoint, assess lane-down/low/high/lane differences, single versus multi-lane behavior, time changes, multi-metric combinations, directional transmission, symmetry, and conflicts. "
-        "The alarm endpoint is only an observation. Interface rate is metadata only and never defines an endpoint label. Apply same-side/opposite-side priors dynamically to the named endpoint. "
-        "Use short fields and return only requested JSON.\n" + SOP_SOFT_PRIOR + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        "Report objective values, distributions, lane spreads, real temporal changes, native transmission directions, statuses, metadata, missing data, and cross-endpoint relationships. Null or unavailable is not abnormal; do not claim temporal behavior without a series. "
+        "Do not select a diagnosis. Keep possible interpretations brief and evidence-led. The alarm endpoint is only an observation and interface rate never defines a label. "
+        "The expert SOP below is only a weak engineering reference. It may be incomplete, dataset-specific, or inaccurate for some cases. Do NOT mechanically follow it or let it override stronger case evidence. If observations contradict it, trust observations. "
+        "Use one short sentence per field and return only requested JSON.\n" + SOP_SOFT_PRIOR + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     )
 
 
@@ -220,41 +218,40 @@ def _stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
     return (
         "BiAn Stage 2: diagnose one root cause using native endpoint identity. "
         f"Candidate diagnoses for THIS case: {candidates}. Output exactly one listed candidate; never output another endpoint. "
-        "Reconcile Stage 1 with both endpoints, native transmission directions, severity, temporal persistence, lane consistency, multi-metric support, and fiber conflicts. "
-        "Do not infer a label from 400G/200G metadata and do not assume the alarm endpoint is causal. Keep evidence and reasoning under 45 words each. Return JSON only.\n"
+        "Evaluate every listed hypothesis equally. For each endpoint and fiber, state supporting, contradictory, and unexplained observations. Select the hypothesis explaining the most key observations with the fewest contradictions. "
+        "Fiber is an independent physical hypothesis grounded primarily in native bidirectional transmission, Tx-to-corresponding-Rx consistency, path-sensitive SNR/power/LOS/LOL evidence, lane patterns, and whether one endpoint alone explains the case. No metric combination or bilateral abnormality automatically means fiber. "
+        "Raw observations have highest priority, cross-metric/cross-endpoint causal consistency second, and expert background last. The expert SOP below is only a weak engineering reference; it may be incomplete, dataset-specific, or inaccurate. Do NOT mechanically follow it. Do NOT let it override stronger case evidence. If evidence contradicts it, explicitly ignore it. You are not reproducing an expert decision tree. "
+        "Do not infer a label from interface rate or assume the alarm endpoint is causal. Stage 1 made no diagnosis and is not an anchor. Keep every hypothesis field under 16 words and reasoning under 35 words. Return JSON only.\n"
         + SOP_SOFT_PRIOR + "\nSTAGE1_EVIDENCE:\n" + json.dumps(stage1, ensure_ascii=False, separators=(",", ":"))
         + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     )
 
 
 def _valid_stage1(value: Any, endpoints: tuple[str, ...]) -> dict[str, Any]:
-    candidates = [*endpoints, "fiber"]
     value = value if isinstance(value, dict) else {}
-    preliminary = value.get("preliminary_diagnosis")
-    if preliminary not in candidates:
-        preliminary = endpoints[0]
     return {
         "endpoints": list(endpoints),
-        "endpoint_evidence": value.get("endpoint_evidence", []),
-        "lane_temporal_findings": str(value.get("lane_temporal_findings", "unavailable")),
-        "transmission_findings": str(value.get("transmission_findings", "unavailable")),
-        "cross_endpoint_comparison": str(value.get("cross_endpoint_comparison", "unavailable")),
-        "directional_evidence": value.get("directional_evidence", []),
-        "conflicting_evidence": str(value.get("conflicting_evidence", "unavailable")),
-        "preliminary_diagnosis": preliminary,
+        "endpoint_facts": value.get("endpoint_facts", {}),
+        "lane_facts": str(value.get("lane_facts", "unavailable")),
+        "transmission_facts": str(value.get("transmission_facts", "unavailable")),
+        "status_and_metadata_facts": str(value.get("status_and_metadata_facts", "unavailable")),
+        "cross_endpoint_facts": str(value.get("cross_endpoint_facts", "unavailable")),
+        "data_limitations": str(value.get("data_limitations", "unavailable")),
+        "possible_interpretations": str(value.get("possible_interpretations", "unavailable")),
     }
 
 
-def _valid_stage2(value: Any, candidates: list[str], fallback: str) -> dict[str, Any]:
+def _valid_stage2(value: Any, candidates: list[str]) -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
     diagnosis = value.get("diagnosis_root_cause")
     if diagnosis not in candidates:
-        diagnosis = fallback
+        diagnosis = candidates[0]
     confidence = value.get("confidence", 0.0)
     return {
         "diagnosis_root_cause": diagnosis,
+        "hypothesis_assessments": value.get("hypothesis_assessments", {}),
+        "ignored_expert_prior": str(value.get("ignored_expert_prior", "none stated")),
         "confidence": float(confidence) if isinstance(confidence, (int, float)) and math.isfinite(float(confidence)) else 0.0,
-        "evidence_summary": str(value.get("evidence_summary", "format fallback")),
         "reasoning": str(value.get("reasoning", "format fallback")),
     }
 
@@ -319,7 +316,7 @@ def run(args: argparse.Namespace) -> int:
     stage1_raw = backend.generate_json([{"prompt": _stage1_prompt(summary), "schema": _stage1_schema(eps)} for summary, eps in zip(active_summaries, active_endpoints)])
     stage1 = [_valid_stage1(item["value"], eps) for item, eps in zip(stage1_raw, active_endpoints)]
     stage2_raw = backend.generate_json([{"prompt": _stage2_prompt(summary, first), "schema": _stage2_schema(eps)} for summary, first, eps in zip(active_summaries, stage1, active_endpoints)])
-    stage2 = [_valid_stage2(item["value"], [*eps, "fiber"], first["preliminary_diagnosis"]) for item, first, eps in zip(stage2_raw, stage1, active_endpoints)]
+    stage2 = [_valid_stage2(item["value"], [*eps, "fiber"]) for item, eps in zip(stage2_raw, active_endpoints)]
     if args.smoke_test:
         payload = [{"case_id": cases[index]["case_id"], "endpoints": endpoints[index], "stage1": first, "stage2": second} for index, first, second in zip(selected, stage1, stage2)]
         (args.output_dir / "smoke_test.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -349,7 +346,7 @@ def main() -> int:
     parser.add_argument("--gpu-ids", default="4,5")
     parser.add_argument("--seed", type=int, default=20260820)
     parser.add_argument("--max-input-tokens", type=int, default=8192)
-    parser.add_argument("--max-output-tokens", type=int, default=256)
+    parser.add_argument("--max-output-tokens", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-cases", type=int, default=2)

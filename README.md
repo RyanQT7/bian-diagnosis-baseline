@@ -14,11 +14,19 @@ derived from 400G/200G interface rates. Other telemetry fields are
 cross-checked for endpoint coverage; missing endpoint telemetry remains
 unavailable. Transmission keys retain native directions such as `l3-l4`.
 
-Stage 1 extracts endpoint-specific, lane, temporal, directional, and conflict
-evidence. Stage 2 applies same-end/opposite-end optical SOP knowledge relative
-to each case's actual endpoint identifiers. The SOP and historical thresholds
-are soft priors only. `alarm_ip_interface` is reported as evidence and does not
-automatically determine the diagnosis.
+Stage 1 produces an objective factual summary of endpoint values, lane spread,
+actual temporal observations, native transmission directions, statuses,
+metadata, and missing data. It does not make a preliminary diagnosis and does
+not create rule-derived threshold flags. Stage 2 independently compares both
+endpoint hypotheses and fiber, recording supporting, contradictory, and
+unexplained observations for each.
+
+Expert SOP knowledge has the lowest evidence priority. It is optional,
+potentially incomplete or inaccurate background and cannot override stronger
+case observations or cross-metric/cross-endpoint consistency. No fixed
+same/opposite mapping or implicit SOP decision tree is implemented.
+`alarm_ip_interface` is evidence and does not automatically determine the
+diagnosis.
 
 ## Run
 
@@ -26,13 +34,13 @@ automatically determine the diagnosis.
 python3 run_experiment.py \
   --data-root /path/to/data \
   --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
-  --output-dir /path/to/results/bian/native_endpoints \
+  --output-dir /path/to/results/bian/fiber_aware \
   --gpu-ids 4,5 --smoke-test
 
 python3 run_experiment.py \
   --data-root /path/to/data \
   --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
-  --output-dir /path/to/results/bian/native_endpoints \
+  --output-dir /path/to/results/bian/fiber_aware \
   --gpu-ids 4,5
 ```
 

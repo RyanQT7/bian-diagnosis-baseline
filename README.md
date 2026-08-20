@@ -1,79 +1,65 @@
-# BiAn Diagnosis Baseline
+# BiAn v3 Diagnosis Baseline
 
-This project adapts the hierarchical/two-stage reasoning idea of *Towards
-LLM-Based Failure Localization in Production-Scale Networks* to the supplied
-case-level task. It uses the local `DeepSeek-R1-Distill-Qwen-32B` model for
-both Stage 1 and Stage 2, loaded in BF16 with vLLM tensor parallelism across
-two GPUs.
-The task output is exactly one of `remote`, `local`, or `fiber` per JSON case.
+This project adapts BiAn's hierarchical two-stage reasoning to case-level
+optical-link diagnosis with `DeepSeek-R1-Distill-Qwen-32B` in both stages.
+Stage 1 extracts structured local/remote physical evidence. Stage 2 applies
+optical-link expert SOP knowledge as soft diagnostic priors, first predicts a
+physical location (`local`, `remote`, or `fiber`), and then converts an endpoint
+fault to the official class using observable endpoint rate.
+
+The official labels are `l1`, `l2`, and `fiber`: `l1` corresponds to a 400G
+fault and `l2` corresponds to a 200G fault. **l1/l2 do not correspond to
+local/remote.** Local and remote are physical endpoint directions used only
+inside diagnosis. The predicted physical endpoint is mapped to `l1` or `l2`
+according to whether that endpoint is 400G or 200G.
+
+Endpoint rate is read from `link_side_ip_interface_map`, whose endpoint strings
+explicitly contain `400G` or `200G`. The alarm endpoint defines the local side
+when available; otherwise JSON endpoint order supplies a deterministic physical
+orientation. No true label is used for this mapping.
 
 ## Run
 
-Use an environment with the local vLLM/Transformers installation and visible
-GPUs. The data argument contains `data1/` and `data2/`; the model argument is
-the local model directory.
+Install `requirements.txt` in a suitable environment. The data root contains
+`data1/` and `data2/`.
 
 ```bash
 python3 run_experiment.py \
   --data-root /path/to/data \
   --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
+  --output-dir /path/to/results/bian/v3_correct_labels \
+  --gpu-ids 4,5 --smoke-test
+
+python3 run_experiment.py \
+  --data-root /path/to/data \
+  --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
+  --output-dir /path/to/results/bian/v3_correct_labels \
   --gpu-ids 4,5
 ```
 
-The optional compact v2 prompt/schema experiment is run without overwriting
-v1:
+The run generates `bian_v3_results.csv`, `scores.txt`, metadata, and a local
+inference audit. Re-score a result with:
 
 ```bash
-python3 run_experiment.py --data-root /path/to/data \
-  --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
-  --gpu-ids 4,5 --prompt-version v2 --max-output-tokens 160 \
-  --output-dir outputs/v2
+python3 score.py --predictions /path/to/bian_v3_results.csv \
+  --output /path/to/scores.txt
 ```
 
-Run the required small load-and-generation check first:
+## Method and leakage controls
 
-```bash
-python3 run_experiment.py --data-root /path/to/data \
-  --model-path /path/to/DeepSeek-R1-Distill-Qwen-32B \
-  --gpu-ids 4,5 --smoke-test
-```
+The inference loader removes the JSON `label` before constructing summaries or
+prompts. It compresses telemetry into per-side metric, lane, temporal, status,
+and cross-side statistics. Historical SOP thresholds are marked
+`expert_reference_only`; they describe evidence and never directly determine a
+class. Stage 2 compares both endpoints, temporal behavior, severity,
+multi-metric consistency, and conflicting fiber evidence.
 
-The full run writes `outputs/bian_results.csv`, `outputs/scores.txt`,
-`outputs/inference_audit.json`, and `outputs/experiment_metadata.json`.
-The audit contains case ids and model responses, but no ground-truth labels.
-Re-score a CSV with:
+Predictions are finalized before the evaluator reopens JSON files for ground
+truth. The evaluator treats the JSON `label` as the sole ground-truth source
+and converts a labelled endpoint to the official class by its observable rate.
+This also handles legacy endpoint identifiers while preserving the official
+`l1`/`l2`/`fiber` scoring space.
 
-```bash
-python3 score.py --predictions outputs/bian_results.csv \
-  --output outputs/scores.txt
-```
-
-## Data and leakage controls
-
-The reader combines all JSON files below `data1/{remote,local,fiber}` and
-`data2/{remote,local,fiber}`. It derives a compact, fixed observable summary:
-numeric mean/std/min/max and temporal slope/delta per canonical side or link
-direction, status summaries, and a small set of observable alarm/time/location
-fields. The explicit JSON `label`, labelled directory, case id, and source
-path are never sent to the model. Ground truth is attached only after both
-model stages have finalized each prediction, for scoring and the required
-CSV.
-
-Stage 1 produces evidence, reasoning, three hypothesis confidences, and a
-ranking. Stage 2 receives that structured analysis plus the observable
-summary and produces the final diagnosis. vLLM guided JSON decoding, greedy
-generation, bounded retry, JSON extraction, and an observation-only
-deterministic fallback keep the final output within the three-class contract.
-
-`outputs/v1/` preserves the original run. Version 2 uses a shorter Stage 1
-representation and an xgrammar-compatible schema, reducing final parse errors
-and runtime. On the complete experiment, however, v2
-Accuracy/Macro-F1 (`0.337171/0.270924`) did not improve on v1
-(`0.463816/0.274348`), so v1 remains the recommended result and the root
-`outputs/bian_results.csv` is intentionally unchanged. The v2 results remain
-available under `outputs/v2/` for reproducibility.
-
-This is a current-dataset adaptation: the data, three-way case task, labels,
-prompts, and 32B model differ from the original paper and from the read-only
-reference implementation. Its reported scores are generated by the current
-experiment, not copied from the paper.
+This differs from the source paper in data, model, prompt, and final task.
+Generated data, predictions, scores, audits, logs, caches, and model weights are
+intentionally ignored and are not committed.

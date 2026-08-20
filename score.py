@@ -4,7 +4,7 @@ import argparse
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 import pandas as pd
-from bian_v3 import OUTPUT_LABELS, score_frame_v3
+from bian_v3 import score_frame_v3
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -17,8 +17,8 @@ def main() -> int:
         raise ValueError(f"expected columns {required}, got {list(frame.columns)}")
     if frame["case_id"].duplicated().any():
         raise ValueError("duplicate case_id")
-    if set(frame["diagnosis_root_cause"]) - set(OUTPUT_LABELS) or set(frame["true_label"]) - set(OUTPUT_LABELS):
-        raise ValueError("labels must be l1/l2/fiber")
+    if frame[["diagnosis_root_cause", "true_label"]].isna().any().any():
+        raise ValueError("labels cannot be missing")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(score_frame_v3(frame), encoding="utf-8")
     print(args.output)

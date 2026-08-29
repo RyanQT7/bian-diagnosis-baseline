@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""API-backed BiAn native-endpoint diagnosis (the former native-endpoint strategy)."""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score
+
+from api_backend import OpenAIResponsesBackend, UsageLedger
+
+
+METRICS = ("bias", "rxpower", "txpower", "media_snr", "host_snr", "serdes_snr")
+STATUS_FIELDS = ("RxLOL", "TxLOL", "TxLOS", "RxLOS")
+ENDPOINT_KEY_FIELDS = METRICS + STATUS_FIELDS + ("vendor", "vendor_sn", "Temperature", "Voltage")
+REFERENCE_THRESHOLDS = {
+    "rxpower": {"lane_down": -40.0, "low": -2.5, "high": 4.6, "lane_diff": 1.0},
+    "txpower": {"lane_down": -40.0, "low": -2.5, "high": 2.5, "lane_diff": 1.3},
+    "host_snr": {"lane_down": 0.0, "low": 22.8, "high": 27.5, "lane_diff": 2.5},
+    "media_snr": {"lane_down": 0.0, "low": 22.4, "high": 28.7, "lane_diff": 3.0},
+    "serdes_snr": {"lane_down": 0.0, "low": 458750.0, "high": 947750.0, "lane_diff": 230000.0},
+}
+
+SOP_SOFT_PRIOR = """EXPERT SOP SOFT PRIORS (not mandatory rules):
+- host_snr and serdes_snr abnormalities usually support the same endpoint.
+- media_snr and rxpower abnormalities usually support the opposite endpoint.
+- txpower abnormality, especially lane-down/extreme loss, strongly supports the same endpoint.
+- combined serdes_snr + media_snr + rxpower anomalies require severity, lanes, time, and other metrics; when coherent they can strongly support the opposite endpoint.
+- strong bilateral, similarly severe, directionally conflicting evidence increases fiber evidence; bilateral asymmetry favors the stronger coherent endpoint.
+Apply same/opposite relative to the actual endpoint identifier where each anomaly occurs. Historical threshold flags are reference-only. Never turn these priors into a decision tree or infer a diagnosis from interface rate."""
+
+
+def numeric_leaves(value: Any) -> list[float]:
+    result: list[float] = []
+    if isinstance(value, dict):
+        for child in value.values():
+            result.extend(numeric_leaves(child))
+    elif isinstance(value, list):
+        for child in value:
+            result.extend(numeric_leaves(child))
+    elif not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)):
+        result.append(float(value))
+    return result
+
+
+def status_number(value: Any) -> float | None:
+    if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on", "up", "alarm", "异常", "是"}:
+            return 1.0
+        if text in {"0", "false", "no", "off", "down", "normal", "正常", "否"}:
+            return 0.0
+    return None
+
+
+def endpoint_keys(data: dict[str, Any]) -> tuple[str, ...]:
+    mapping = data.get("link_side_ip_interface_map")
+    if not isinstance(mapping, dict) or len(mapping) < 2:
+        raise ValueError("link_side_ip_interface_map must define at least two endpoints")
+    endpoints = tuple(str(key) for key in mapping)
+    if len(set(endpoints)) != len(endpoints):
+        raise ValueError("duplicate endpoint identifier")
+    return endpoints
+
+
+def load_cases(data_root: Path, selected_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    roots = [data_root / "data1", data_root / "data2"]
+    if not any(root.is_dir() for root in roots):
+        roots = [data_root]
+    cases: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path in sorted(root.glob("*/*.json")):
+            case_id = path.stem
+            if case_id in seen:
+                raise ValueError(f"duplicate case_id: {case_id}")
+            seen.add(case_id)
+            if selected_ids is not None and case_id not in selected_ids:
+                continue
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError(f"case is not an object: {path}")
+            # Ground truth is intentionally removed before any summary or API prompt.
+            observable = {key: value for key, value in raw.items() if key != "label"}
+            endpoint_keys(observable)
+            cases.append({"case_id": case_id, "source_path": path, "data": observable})
+    if not cases:
+        raise ValueError(f"no selected cases below {data_root}")
+    return sorted(cases, key=lambda item: item["case_id"])
+
+
+def _lane_series(raw: Any) -> dict[str, list[float]]:
+    if isinstance(raw, dict):
+        lanes = {str(key): numeric_leaves(value) for key, value in raw.items()}
+        if any(lanes.values()):
+            return lanes
+    values = numeric_leaves(raw)
+    return {"aggregate": values} if values else {}
+
+
+def _metric_summary(raw: Any, metric: str) -> dict[str, Any]:
+    lanes = _lane_series(raw)
+    lane_means = {lane: float(np.mean(values)) for lane, values in lanes.items() if values}
+    values = [value for lane in lanes.values() for value in lane]
+    if not values:
+        return {"available": False, "state_candidates": ["uncertain"]}
+    array = np.asarray(values, dtype=float)
+    deltas = [lane[-1] - lane[0] for lane in lanes.values() if len(lane) > 1]
+    lane_diff = max(lane_means.values()) - min(lane_means.values()) if len(lane_means) > 1 else 0.0
+    result: dict[str, Any] = {
+        "available": True,
+        "lane_values_or_means": {key: round(value, 6) for key, value in lane_means.items()},
+        "mean": round(float(np.mean(array)), 6), "median": round(float(np.median(array)), 6),
+        "std": round(float(np.std(array)), 6), "min": round(float(np.min(array)), 6),
+        "max": round(float(np.max(array)), 6), "lane_difference": round(float(lane_diff), 6),
+        "temporal_mean_delta": round(float(np.mean(deltas)), 6) if deltas else None,
+        "temporal_max_abs_delta": round(float(max(map(abs, deltas))), 6) if deltas else None,
+    }
+    states: list[str] = []
+    flags: list[str] = []
+    reference = REFERENCE_THRESHOLDS.get(metric)
+    if reference:
+        checks = (
+            (any(v <= reference["lane_down"] for v in lane_means.values()), "lane_down", "at_or_below_lane_down_reference"),
+            (any(v < reference["low"] for v in lane_means.values()), "low_value", "below_low_reference"),
+            (any(v > reference["high"] for v in lane_means.values()), "high_value", "above_high_reference"),
+            (lane_diff > reference["lane_diff"], "lane_difference", "above_lane_difference_reference"),
+        )
+        for matched, state, flag in checks:
+            if matched:
+                states.append(state)
+                flags.append(flag)
+    result["state_candidates"] = states or ["normal_or_uncertain"]
+    result["reference_threshold_flag"] = {"scope": "expert_reference_only", "flags": flags}
+    return result
+
+
+def _status_summary(raw: Any) -> dict[str, Any]:
+    items = list(raw.values()) if isinstance(raw, dict) else [raw]
+    parsed = [status_number(value) for value in items]
+    valid = [value for value in parsed if value is not None]
+    return {"available": bool(valid), "abnormal_fraction": round(float(np.mean(valid)), 6) if valid else None}
+
+
+def summarize_case(data: dict[str, Any]) -> dict[str, Any]:
+    endpoints = endpoint_keys(data)
+    mapping = data["link_side_ip_interface_map"]
+    alarm_interface = data.get("alarm_ip_interface")
+    alarm_endpoint = next((endpoint for endpoint in endpoints if mapping.get(endpoint) == alarm_interface), None)
+    metadata = {endpoint: {"interface": mapping.get(endpoint), "rate_is_metadata_only": True} for endpoint in endpoints}
+    evidence: dict[str, Any] = {}
+    for endpoint in endpoints:
+        evidence[endpoint] = {
+            metric: _metric_summary(
+                data.get(metric, {}).get(endpoint) if isinstance(data.get(metric), dict) else None, metric
+            ) for metric in METRICS
+        }
+        evidence[endpoint]["status"] = {
+            field: _status_summary(data.get(field, {}).get(endpoint) if isinstance(data.get(field), dict) else None)
+            for field in STATUS_FIELDS
+        }
+    transmission: dict[str, Any] = {}
+    raw_transmission = data.get("transmission")
+    for source in endpoints:
+        for target in endpoints:
+            if source != target:
+                direction = f"{source}-{target}"
+                transmission[direction] = _metric_summary(
+                    raw_transmission.get(direction) if isinstance(raw_transmission, dict) else None,
+                    "transmission",
+                )
+    coverage = {}
+    for field in ENDPOINT_KEY_FIELDS:
+        raw = data.get(field)
+        coverage[field] = {endpoint: bool(isinstance(raw, dict) and endpoint in raw) for endpoint in endpoints}
+    cross = {}
+    for left_index, left in enumerate(endpoints):
+        for right in endpoints[left_index + 1:]:
+            for metric in METRICS:
+                a = evidence[left][metric].get("mean")
+                b = evidence[right][metric].get("mean")
+                cross[f"{metric}.{left}_minus_{right}_mean"] = round(float(a - b), 6) if a is not None and b is not None else None
+    return {
+        "endpoints": list(endpoints),
+        "candidate_diagnoses": [*endpoints, "fiber"],
+        "endpoint_metadata": metadata,
+        "alarm_observation": {
+            "alarm_name": data.get("alarm_name"), "alarm_time": data.get("alarm_time"),
+            "alarm_endpoint": alarm_endpoint,
+            "note": "alarm endpoint is evidence, not an automatic root cause",
+        },
+        "endpoint_field_coverage": coverage,
+        "endpoint_evidence": evidence,
+        "transmission_by_native_direction": transmission,
+        "cross_endpoint_comparison": cross,
+        "threshold_note": "reference flags are expert_reference_only and cannot directly determine diagnosis",
+    }
+
+
+def stage1_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+    candidates = [*endpoints, "fiber"]
+    return {
+        "title": "bian_stage1",
+        "type": "object",
+        "properties": {
+            "endpoint_evidence": {"type": "array", "items": {"type": "object", "properties": {
+                "endpoint": {"type": "string", "enum": list(endpoints)}, "evidence": {"type": "string"},
+            }, "required": ["endpoint", "evidence"], "additionalProperties": False}},
+            "lane_temporal_findings": {"type": "string"},
+            "transmission_findings": {"type": "string"},
+            "cross_endpoint_comparison": {"type": "string"},
+            "directional_evidence": {"type": "array", "items": {"type": "object", "properties": {
+                "diagnosis": {"type": "string", "enum": candidates}, "evidence": {"type": "string"},
+            }, "required": ["diagnosis", "evidence"], "additionalProperties": False}},
+            "conflicting_evidence": {"type": "string"},
+            "preliminary_diagnosis": {"type": "string", "enum": candidates},
+        },
+        "required": ["endpoint_evidence", "lane_temporal_findings", "transmission_findings",
+                      "cross_endpoint_comparison", "directional_evidence", "conflicting_evidence",
+                      "preliminary_diagnosis"],
+        "additionalProperties": False,
+    }
+
+
+def stage2_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "title": "bian_stage2",
+        "type": "object",
+        "properties": {
+            "diagnosis_root_cause": {"type": "string", "enum": [*endpoints, "fiber"]},
+            "confidence": {"type": "number"},
+            "evidence_summary": {"type": "string"},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["diagnosis_root_cause", "confidence", "evidence_summary", "reasoning"],
+        "additionalProperties": False,
+    }
+
+
+def stage1_prompt(summary: dict[str, Any]) -> str:
+    candidates = ", ".join(summary["candidate_diagnoses"])
+    return (
+        "BiAn Stage 1: extract physical evidence using the native endpoint identifiers exactly as provided. "
+        f"Candidate diagnoses for THIS case: {candidates}. Do not rename endpoints as local, remote, side_a, or side_b. "
+        "For every endpoint, assess lane-down/low/high/lane differences, single versus multi-lane behavior, time changes, multi-metric combinations, directional transmission, symmetry, and conflicts. "
+        "The alarm endpoint is only an observation. Interface rate is metadata only and never defines an endpoint label. Apply same-side/opposite-side priors dynamically to the named endpoint. "
+        "Use short fields and return only requested JSON.\n" + SOP_SOFT_PRIOR
+        + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
+    candidates = ", ".join(summary["candidate_diagnoses"])
+    return (
+        "BiAn Stage 2: diagnose one root cause using native endpoint identity. "
+        f"Candidate diagnoses for THIS case: {candidates}. Output exactly one listed candidate; never output another endpoint. "
+        "Reconcile Stage 1 with both endpoints, native transmission directions, severity, temporal persistence, lane consistency, multi-metric support, and fiber conflicts. "
+        "Do not infer a label from 400G/200G metadata and do not assume the alarm endpoint is causal. Keep evidence and reasoning under 45 words each. Return JSON only.\n" + SOP_SOFT_PRIOR
+        + "\nSTAGE1_EVIDENCE:\n" + json.dumps(stage1, ensure_ascii=False, separators=(",", ":"))
+        + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def fallback_stage1(endpoints: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "endpoints": list(endpoints), "endpoint_evidence": [], "lane_temporal_findings": "unavailable",
+        "transmission_findings": "unavailable", "cross_endpoint_comparison": "unavailable",
+        "directional_evidence": [], "conflicting_evidence": "unavailable",
+        "preliminary_diagnosis": endpoints[0],
+    }
+
+
+def normalize_stage1(value: Any, endpoints: tuple[str, ...]) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    candidates = {*endpoints, "fiber"}
+    preliminary = value.get("preliminary_diagnosis")
+    if preliminary not in candidates:
+        preliminary = endpoints[0]
+    return {
+        "endpoints": list(endpoints),
+        "endpoint_evidence": value.get("endpoint_evidence", []) if isinstance(value.get("endpoint_evidence", []), list) else [],
+        "lane_temporal_findings": str(value.get("lane_temporal_findings", "unavailable")),
+        "transmission_findings": str(value.get("transmission_findings", "unavailable")),
+        "cross_endpoint_comparison": str(value.get("cross_endpoint_comparison", "unavailable")),
+        "directional_evidence": value.get("directional_evidence", []) if isinstance(value.get("directional_evidence", []), list) else [],
+        "conflicting_evidence": str(value.get("conflicting_evidence", "unavailable")),
+        "preliminary_diagnosis": preliminary,
+    }
+
+
+def normalize_stage2(value: Any, candidates: list[str], fallback: str) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    diagnosis = value.get("diagnosis_root_cause")
+    if diagnosis not in candidates:
+        diagnosis = fallback if fallback in candidates else candidates[0]
+    confidence = value.get("confidence", 0.0)
+    if not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence)):
+        confidence = 0.0
+    return {
+        "diagnosis_root_cause": diagnosis, "confidence": float(confidence),
+        "evidence_summary": str(value.get("evidence_summary", "format fallback")),
+        "reasoning": str(value.get("reasoning", "format fallback")),
+    }
+
+
+def truth_after_predictions(cases: list[dict[str, Any]]) -> dict[str, str]:
+    truth: dict[str, str] = {}
+    for case in cases:
+        raw = json.loads(case["source_path"].read_text(encoding="utf-8"))
+        label = raw.get("label")
+        candidates = [*endpoint_keys(case["data"]), "fiber"]
+        if label not in candidates:
+            raise ValueError(f"JSON label outside native candidates for {case['case_id']}: {label}")
+        truth[case["case_id"]] = str(label)
+    return truth
+
+
+def score_frame(frame: pd.DataFrame) -> str:
+    labels = sorted((set(frame["true_label"]) | set(frame["diagnosis_root_cause"])) - {"fiber"}) + ["fiber"]
+    y_true = frame["true_label"].tolist()
+    y_pred = frame["diagnosis_root_cause"].tolist()
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    report = classification_report(y_true, y_pred, labels=labels, target_names=labels, digits=6, zero_division=0)
+    lines = [
+        "BiAn API case-native endpoint scores",
+        f"Cases: {len(frame)}",
+        f"Accuracy: {accuracy_score(y_true, y_pred):.6f}",
+        f"Macro Precision: {precision_score(y_true, y_pred, labels=labels, average='macro', zero_division=0):.6f}",
+        f"Macro Recall: {recall_score(y_true, y_pred, labels=labels, average='macro', zero_division=0):.6f}",
+        f"Macro F1: {f1_score(y_true, y_pred, labels=labels, average='macro', zero_division=0):.6f}",
+        "", report.rstrip(), "", f"Confusion Matrix (rows=true, columns=predicted; order={','.join(labels)}):",
+        "              " + "  ".join(f"{label:>6}" for label in labels),
+    ]
+    lines.extend(f"{label:>12}  " + "  ".join(f"{int(value):>6}" for value in row) for label, row in zip(labels, cm))
+    return "\n".join(lines) + "\n"
+
+
+def load_split_ids(split_dir: Path, subset: str, all_case_ids: set[str]) -> set[str]:
+    if subset == "all":
+        return all_case_ids
+    filename = "train_case_ids.json" if subset == "train" else "test_case_ids.json"
+    ids = set(json.loads((split_dir / filename).read_text(encoding="utf-8")))
+    if not ids <= all_case_ids:
+        raise ValueError(f"split contains unknown case IDs: {sorted(ids - all_case_ids)[:3]}")
+    return ids
+
+
+def _read_resume(path: Path) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if isinstance(record, dict) and isinstance(record.get("case_id"), str):
+            records[record["case_id"]] = record
+    return records
+
+
+def _append_record(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _write_usage(output_dir: Path, ledger: UsageLedger, completed_cases: int) -> None:
+    payload = ledger.as_dict(completed_cases)
+    (output_dir / "token_usage.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    overall = payload["overall"]
+    lines = [
+        "API token usage (actual response usage when a run is performed)",
+        f"Completed cases: {completed_cases}",
+    ]
+    for stage in ("stage1", "stage2"):
+        stats = payload["stages"].get(stage, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+        lines.append(f"{stage}: calls={stats['calls']}, input_tokens={stats['input_tokens']}, output_tokens={stats['output_tokens']}")
+    lines.extend([
+        f"Retries: calls={payload['retries']['calls']}, input_tokens={payload['retries']['input_tokens']}, output_tokens={payload['retries']['output_tokens']}",
+        f"Overall: calls={overall['calls']}, input_tokens={overall['input_tokens']}, output_tokens={overall['output_tokens']}, total_tokens={overall['total_tokens']}",
+    ])
+    if completed_cases:
+        average = payload["average_per_case"]
+        lines.append("Average per case: " + ", ".join(f"{key}={value:.2f}" for key, value in average.items()))
+    (output_dir / "token_usage_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run(args: argparse.Namespace) -> int:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    all_cases = load_cases(args.data_root)
+    all_ids = {case["case_id"] for case in all_cases}
+    if args.split_dir:
+        selected_ids = load_split_ids(args.split_dir, args.subset, all_ids)
+    elif args.subset != "all":
+        raise ValueError("--split-dir is required unless --subset all is selected")
+    else:
+        selected_ids = all_ids
+    cases = [case for case in all_cases if case["case_id"] in selected_ids]
+    summaries = [summarize_case(case["data"]) for case in cases]
+    endpoints = [endpoint_keys(case["data"]) for case in cases]
+
+    if args.dry_run:
+        rows = []
+        for case, summary, eps in zip(cases, summaries, endpoints):
+            first = fallback_stage1(eps)
+            rows.append({
+                "case_id": case["case_id"], "endpoints": list(eps),
+                "stage1_prompt_chars": len(stage1_prompt(summary)),
+                "stage2_prompt_chars": len(stage2_prompt(summary, first)),
+                "candidate_diagnoses": [*eps, "fiber"],
+            })
+        if args.limit is not None:
+            rows = rows[:args.limit]
+        (args.output_dir / "dry_run_summary.json").write_text(json.dumps({"api_calls": 0, "cases": rows}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"dry-run complete: cases={len(rows)}, api_calls=0")
+        return 0
+
+    if not args.model:
+        raise ValueError("--model or OPENAI_MODEL is required for a real API run")
+    if args.limit is not None:
+        cases = cases[:args.limit]
+        summaries = summaries[:args.limit]
+        endpoints = endpoints[:args.limit]
+    records_path = args.output_dir / "api_records.jsonl"
+    resume_records = _read_resume(records_path) if args.resume else {}
+    usage_path = args.output_dir / "token_usage.json"
+    ledger = UsageLedger.from_dict(json.loads(usage_path.read_text(encoding="utf-8"))) if args.resume and usage_path.exists() else UsageLedger()
+    backend = OpenAIResponsesBackend(args.model, args.max_output_tokens, args.max_retries, args.reasoning_effort, ledger)
+    predictions: dict[str, str] = {}
+    normalized_records: list[dict[str, Any]] = []
+    for case, summary, eps in zip(cases, summaries, endpoints):
+        candidates = [*eps, "fiber"]
+        existing = resume_records.get(case["case_id"])
+        if existing and tuple(existing.get("endpoints", [])) == eps and existing.get("diagnosis_root_cause") in candidates:
+            predictions[case["case_id"]] = existing["diagnosis_root_cause"]
+            normalized_records.append(existing)
+            continue
+        first_response = backend.request_json(
+            stage1_prompt(summary), stage1_schema(eps), "stage1",
+            lambda value: value.get("preliminary_diagnosis") in set(candidates),
+        )
+        first = normalize_stage1(first_response["value"], eps) if first_response["value"] is not None else fallback_stage1(eps)
+        second_response = backend.request_json(
+            stage2_prompt(summary, first), stage2_schema(eps), "stage2",
+            lambda value: value.get("diagnosis_root_cause") in set(candidates),
+        )
+        second = normalize_stage2(second_response["value"], candidates, first["preliminary_diagnosis"])
+        predictions[case["case_id"]] = second["diagnosis_root_cause"]
+        record = {
+            "case_id": case["case_id"], "endpoints": list(eps),
+            "diagnosis_root_cause": second["diagnosis_root_cause"],
+            "stage1_attempt": first_response["attempt"], "stage2_attempt": second_response["attempt"],
+            "stage1_error": first_response["error"], "stage2_error": second_response["error"],
+        }
+        normalized_records.append(record)
+        _append_record(records_path, record)
+        _write_usage(args.output_dir, ledger, len(predictions))
+
+    # No ground truth is read until every prediction in this selected run is fixed.
+    truth = truth_after_predictions(cases)
+    frame = pd.DataFrame({
+        "case_id": [case["case_id"] for case in cases],
+        "diagnosis_root_cause": [predictions[case["case_id"]] for case in cases],
+        "true_label": [truth[case["case_id"]] for case in cases],
+    })
+    if frame["case_id"].duplicated().any() or len(frame) != len(cases):
+        raise AssertionError("incomplete or duplicate API prediction set")
+    frame.to_csv(args.output_dir / "api_results.csv", index=False)
+    (args.output_dir / "scores.txt").write_text(score_frame(frame), encoding="utf-8")
+    _write_usage(args.output_dir, ledger, len(predictions))
+    print((args.output_dir / "scores.txt").read_text(encoding="utf-8"))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--split-dir", type=Path)
+    parser.add_argument("--subset", choices=("train", "test", "all"), default="test")
+    parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"))
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--max-output-tokens", type=int, default=256)
+    parser.add_argument("--reasoning-effort")
+    parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limit", type=int)
+    return run(parser.parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

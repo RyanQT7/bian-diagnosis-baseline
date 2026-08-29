@@ -18,3 +18,7 @@ cache/
 outputs/
 results/
 logs/
+api_version/outputs/
+api_version/results/
+api_version/cache/
+*.jsonl

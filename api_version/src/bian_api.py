@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -207,26 +208,18 @@ def summarize_case(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def stage1_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
-    candidates = [*endpoints, "fiber"]
+    endpoint_properties = {endpoint: {"type": "string"} for endpoint in endpoints}
     return {
         "title": "bian_stage1",
         "type": "object",
         "properties": {
-            "endpoint_evidence": {"type": "array", "items": {"type": "object", "properties": {
-                "endpoint": {"type": "string", "enum": list(endpoints)}, "evidence": {"type": "string"},
-            }, "required": ["endpoint", "evidence"], "additionalProperties": False}},
-            "lane_temporal_findings": {"type": "string"},
-            "transmission_findings": {"type": "string"},
-            "cross_endpoint_comparison": {"type": "string"},
-            "directional_evidence": {"type": "array", "items": {"type": "object", "properties": {
-                "diagnosis": {"type": "string", "enum": candidates}, "evidence": {"type": "string"},
-            }, "required": ["diagnosis", "evidence"], "additionalProperties": False}},
-            "conflicting_evidence": {"type": "string"},
-            "preliminary_diagnosis": {"type": "string", "enum": candidates},
+            "endpoint_evidence": {"type": "object", "properties": endpoint_properties,
+                                   "required": list(endpoints), "additionalProperties": False},
+            "cross_endpoint_evidence": {"type": "string"},
+            "fiber_evidence": {"type": "string"},
+            "uncertainty": {"type": "string"},
         },
-        "required": ["endpoint_evidence", "lane_temporal_findings", "transmission_findings",
-                      "cross_endpoint_comparison", "directional_evidence", "conflicting_evidence",
-                      "preliminary_diagnosis"],
+        "required": ["endpoint_evidence", "cross_endpoint_evidence", "fiber_evidence", "uncertainty"],
         "additionalProperties": False,
     }
 
@@ -238,11 +231,10 @@ def stage2_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
         "properties": {
             "diagnosis_root_cause": {"type": "string", "enum": [*endpoints, "fiber"]},
             "confidence": {"type": "number"},
-            "evidence_summary": {"type": "string"},
-            "reasoning": {"type": "string"},
+            "reason": {"type": "string"},
         },
-        "required": ["diagnosis_root_cause", "confidence", "evidence_summary", "reasoning"],
-        "additionalProperties": False,
+        "required": ["diagnosis_root_cause"],
+        "additionalProperties": True,
     }
 
 
@@ -253,7 +245,8 @@ def stage1_prompt(summary: dict[str, Any]) -> str:
         f"Candidate diagnoses for THIS case: {candidates}. Do not rename endpoints as local, remote, side_a, or side_b. "
         "For every endpoint, assess lane-down/low/high/lane differences, single versus multi-lane behavior, time changes, multi-metric combinations, directional transmission, symmetry, and conflicts. "
         "The alarm endpoint is only an observation. Interface rate is metadata only and never defines an endpoint label. Apply same-side/opposite-side priors dynamically to the named endpoint. "
-        "Use short fields and return only requested JSON.\n" + SOP_SOFT_PRIOR
+        "Return ONLY one valid JSON object with these fields: endpoint_evidence (an object with one short string per endpoint), "
+        "cross_endpoint_evidence, fiber_evidence, uncertainty. Do not use markdown, code fences, or prose outside JSON.\n" + SOP_SOFT_PRIOR
         + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -264,7 +257,9 @@ def stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
         "BiAn Stage 2: diagnose one root cause using native endpoint identity. "
         f"Candidate diagnoses for THIS case: {candidates}. Output exactly one listed candidate; never output another endpoint. "
         "Reconcile Stage 1 with both endpoints, native transmission directions, severity, temporal persistence, lane consistency, multi-metric support, and fiber conflicts. "
-        "Do not infer a label from 400G/200G metadata and do not assume the alarm endpoint is causal. Keep evidence and reasoning under 45 words each. Return JSON only.\n" + SOP_SOFT_PRIOR
+        "Do not infer a label from 400G/200G metadata and do not assume the alarm endpoint is causal. "
+        "Return ONLY one valid JSON object with diagnosis_root_cause, confidence, and reason. "
+        "Do not use markdown, code fences, or prose outside JSON.\n" + SOP_SOFT_PRIOR
         + "\nSTAGE1_EVIDENCE:\n" + json.dumps(stage1, ensure_ascii=False, separators=(",", ":"))
         + "\nOBSERVABLE_SUMMARY:\n" + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     )
@@ -272,28 +267,29 @@ def stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
 
 def fallback_stage1(endpoints: tuple[str, ...]) -> dict[str, Any]:
     return {
-        "endpoints": list(endpoints), "endpoint_evidence": [], "lane_temporal_findings": "unavailable",
-        "transmission_findings": "unavailable", "cross_endpoint_comparison": "unavailable",
-        "directional_evidence": [], "conflicting_evidence": "unavailable",
-        "preliminary_diagnosis": endpoints[0],
+        "endpoints": list(endpoints), "endpoint_evidence": {endpoint: "unavailable" for endpoint in endpoints},
+        "cross_endpoint_evidence": "unavailable", "fiber_evidence": "unavailable", "uncertainty": "unavailable",
     }
 
 
 def normalize_stage1(value: Any, endpoints: tuple[str, ...]) -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
-    candidates = {*endpoints, "fiber"}
-    preliminary = value.get("preliminary_diagnosis")
-    if preliminary not in candidates:
-        preliminary = endpoints[0]
+    raw_evidence = value.get("endpoint_evidence", {})
+    evidence: dict[str, str] = {endpoint: "unavailable" for endpoint in endpoints}
+    if isinstance(raw_evidence, dict):
+        for endpoint in endpoints:
+            if endpoint in raw_evidence:
+                evidence[endpoint] = str(raw_evidence[endpoint])
+    elif isinstance(raw_evidence, list):
+        for item in raw_evidence:
+            if isinstance(item, dict) and item.get("endpoint") in evidence:
+                evidence[str(item["endpoint"])] = str(item.get("evidence", "unavailable"))
     return {
         "endpoints": list(endpoints),
-        "endpoint_evidence": value.get("endpoint_evidence", []) if isinstance(value.get("endpoint_evidence", []), list) else [],
-        "lane_temporal_findings": str(value.get("lane_temporal_findings", "unavailable")),
-        "transmission_findings": str(value.get("transmission_findings", "unavailable")),
-        "cross_endpoint_comparison": str(value.get("cross_endpoint_comparison", "unavailable")),
-        "directional_evidence": value.get("directional_evidence", []) if isinstance(value.get("directional_evidence", []), list) else [],
-        "conflicting_evidence": str(value.get("conflicting_evidence", "unavailable")),
-        "preliminary_diagnosis": preliminary,
+        "endpoint_evidence": evidence,
+        "cross_endpoint_evidence": str(value.get("cross_endpoint_evidence", value.get("cross_endpoint_comparison", "unavailable"))),
+        "fiber_evidence": str(value.get("fiber_evidence", "unavailable")),
+        "uncertainty": str(value.get("uncertainty", value.get("conflicting_evidence", "unavailable"))),
     }
 
 
@@ -303,13 +299,30 @@ def normalize_stage2(value: Any, candidates: list[str], fallback: str) -> dict[s
     if diagnosis not in candidates:
         diagnosis = fallback if fallback in candidates else candidates[0]
     confidence = value.get("confidence", 0.0)
-    if not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence)):
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
         confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    if 1.0 < confidence <= 100.0:
+        confidence /= 100.0
+    confidence = min(1.0, max(0.0, confidence))
     return {
-        "diagnosis_root_cause": diagnosis, "confidence": float(confidence),
-        "evidence_summary": str(value.get("evidence_summary", "format fallback")),
-        "reasoning": str(value.get("reasoning", "format fallback")),
+        "diagnosis_root_cause": diagnosis, "confidence": confidence,
+        "reason": str(value.get("reason", value.get("reasoning", "format fallback"))),
     }
+
+
+def valid_stage1(value: Any, endpoints: tuple[str, ...]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    evidence = value.get("endpoint_evidence")
+    if isinstance(evidence, dict):
+        return any(endpoint in evidence for endpoint in endpoints)
+    if isinstance(evidence, list):
+        return any(isinstance(item, dict) and item.get("endpoint") in endpoints for item in evidence)
+    return False
 
 
 def truth_after_predictions(cases: list[dict[str, Any]]) -> dict[str, str]:
@@ -368,8 +381,20 @@ def _read_resume(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _append_record(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _write_debug_response(debug_dir: Path | None, stage: str, raw_text: str) -> None:
+    if debug_dir is None:
+        return
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    safe_text = (raw_text or "").replace(api_key, "[redacted]") if api_key else (raw_text or "")
+    (debug_dir / f"{stage}_raw.txt").write_text(safe_text, encoding="utf-8")
 
 
 def _write_usage(output_dir: Path, ledger: UsageLedger, completed_cases: int) -> None:
@@ -381,16 +406,95 @@ def _write_usage(output_dir: Path, ledger: UsageLedger, completed_cases: int) ->
         f"Completed cases: {completed_cases}",
     ]
     for stage in ("stage1", "stage2"):
-        stats = payload["stages"].get(stage, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
-        lines.append(f"{stage}: calls={stats['calls']}, input_tokens={stats['input_tokens']}, output_tokens={stats['output_tokens']}")
+        stats = payload["stages"].get(stage, {
+            "calls": 0, "input_tokens": 0, "output_tokens": 0,
+            "unknown_usage_requests": 0, "cached_input_tokens": 0,
+        })
+        lines.append(
+            f"{stage}: calls={stats['calls']}, input_tokens={stats['input_tokens']}, "
+            f"output_tokens={stats['output_tokens']}, cached_input_tokens={stats.get('cached_input_tokens', 0)}, "
+            f"unknown_usage_requests={stats.get('unknown_usage_requests', 0)}"
+        )
     lines.extend([
         f"Retries: calls={payload['retries']['calls']}, input_tokens={payload['retries']['input_tokens']}, output_tokens={payload['retries']['output_tokens']}",
-        f"Overall: calls={overall['calls']}, input_tokens={overall['input_tokens']}, output_tokens={overall['output_tokens']}, total_tokens={overall['total_tokens']}",
+        f"Overall: calls={overall['calls']}, input_tokens={overall['input_tokens']}, output_tokens={overall['output_tokens']}, "
+        f"total_tokens={overall['total_tokens']}, unknown_usage_requests={overall.get('unknown_usage_requests', 0)}",
     ])
     if completed_cases:
         average = payload["average_per_case"]
         lines.append("Average per case: " + ", ".join(f"{key}={value:.2f}" for key, value in average.items()))
-    (output_dir / "token_usage_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = "\n".join(lines) + "\n"
+    (output_dir / "token_usage_summary.txt").write_text(text, encoding="utf-8")
+    (output_dir / "token_usage.txt").write_text(text, encoding="utf-8")
+
+
+def _write_reliability_reports(
+    output_dir: Path,
+    records: list[dict[str, Any]],
+    ledger: UsageLedger,
+    model: str,
+    base_url: str | None,
+) -> None:
+    payload = ledger.as_dict(len(records))
+    request_log_path = output_dir / "request_log.jsonl"
+    request_logs = [
+        json.loads(line) for line in request_log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ] if request_log_path.exists() else []
+    status_counts = Counter(str(record.get("status", "UNKNOWN")) for record in records)
+    error_counts = Counter(
+        str(item.get("error_category"))
+        for item in request_logs
+        if item.get("error_category")
+    )
+    summary = {
+        "model": model,
+        "base_url": base_url,
+        "cases": len(records),
+        "successful_cases": status_counts.get("SUCCESS", 0),
+        "failed_cases": len(records) - status_counts.get("SUCCESS", 0),
+        "api_calls": payload["overall"]["calls"],
+        "retries": payload["retries"]["calls"],
+        "known_input_tokens": payload["overall"]["input_tokens"],
+        "known_output_tokens": payload["overall"]["output_tokens"],
+        "known_total_tokens": payload["overall"]["total_tokens"],
+        "unknown_usage_requests": payload["overall"].get("unknown_usage_requests", 0),
+        "error_counts": dict(sorted(error_counts.items())),
+        "per_case": records,
+        "full_test_not_started": True,
+    }
+    (output_dir / "request_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    error_lines = [
+        "BiAn API reliability error summary",
+        f"Cases: {len(records)}",
+        f"Successful cases: {summary['successful_cases']}",
+        f"Failed cases: {summary['failed_cases']}",
+        "",
+        "Request failure categories:",
+    ]
+    if error_counts:
+        error_lines.extend(f"{category}: {count}" for category, count in sorted(error_counts.items()))
+    else:
+        error_lines.append("none")
+    error_lines.extend([
+        "",
+        f"Unknown-usage requests: {summary['unknown_usage_requests']}",
+        "Timeout/transport requests with no provider usage are not counted as zero-consumed.",
+        "True labels were not read; full 484-case evaluation was not started.",
+    ])
+    (output_dir / "error_summary.txt").write_text("\n".join(error_lines) + "\n", encoding="utf-8")
+    usage_text = (output_dir / "token_usage.txt").read_text(encoding="utf-8")
+    usage_lines = [usage_text.rstrip(), "", "Per-case reliability usage:"]
+    for record in records:
+        usage_lines.append(
+            f"{record.get('case_id')}: status={record.get('status')}, "
+            f"input={record.get('input_tokens', 0)}, output={record.get('output_tokens', 0)}, "
+            f"total={record.get('total_tokens', 0)}, calls={record.get('api_calls', 0)}, "
+            f"retries={record.get('retries', 0)}, latency={record.get('latency_seconds', 0)}s"
+        )
+    (output_dir / "token_usage.txt").write_text("\n".join(usage_lines) + "\n", encoding="utf-8")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -433,36 +537,104 @@ def run(args: argparse.Namespace) -> int:
     resume_records = _read_resume(records_path) if args.resume else {}
     usage_path = args.output_dir / "token_usage.json"
     ledger = UsageLedger.from_dict(json.loads(usage_path.read_text(encoding="utf-8"))) if args.resume and usage_path.exists() else UsageLedger()
-    backend = OpenAIResponsesBackend(args.model, args.max_output_tokens, args.max_retries, args.reasoning_effort, ledger)
+    read_timeout = args.timeout_seconds if args.timeout_seconds is not None else args.read_timeout_seconds
+    backend = OpenAIResponsesBackend(
+        args.model,
+        args.max_output_tokens,
+        args.max_retries,
+        args.reasoning_effort,
+        ledger,
+        base_url=args.base_url,
+        timeout_seconds=read_timeout,
+        connect_timeout_seconds=args.connect_timeout_seconds,
+        read_timeout_seconds=read_timeout,
+        write_timeout_seconds=args.write_timeout_seconds,
+        pool_timeout_seconds=args.pool_timeout_seconds,
+        request_log_path=args.output_dir / "request_log.jsonl",
+    )
     predictions: dict[str, str] = {}
     normalized_records: list[dict[str, Any]] = []
     for case, summary, eps in zip(cases, summaries, endpoints):
+        case_started = time.monotonic()
         candidates = [*eps, "fiber"]
         existing = resume_records.get(case["case_id"])
-        if existing and tuple(existing.get("endpoints", [])) == eps and existing.get("diagnosis_root_cause") in candidates:
+        if (
+            existing
+            and existing.get("status") == "SUCCESS"
+            and tuple(existing.get("endpoints", [])) == eps
+            and existing.get("diagnosis_root_cause") in candidates
+        ):
             predictions[case["case_id"]] = existing["diagnosis_root_cause"]
             normalized_records.append(existing)
             continue
+        stage1_before = dict(ledger.stages.get("stage1", {}))
+        stage1_started = time.monotonic()
         first_response = backend.request_json(
             stage1_prompt(summary), stage1_schema(eps), "stage1",
-            lambda value: value.get("preliminary_diagnosis") in set(candidates),
+            lambda value: valid_stage1(value, eps),
+            case_id=case["case_id"],
         )
+        stage1_latency = time.monotonic() - stage1_started
+        stage1_after = dict(ledger.stages.get("stage1", {}))
+        _write_debug_response(args.debug_dir, "stage1", first_response.get("raw_text", ""))
         first = normalize_stage1(first_response["value"], eps) if first_response["value"] is not None else fallback_stage1(eps)
+        stage2_before = dict(ledger.stages.get("stage2", {}))
+        stage2_started = time.monotonic()
         second_response = backend.request_json(
             stage2_prompt(summary, first), stage2_schema(eps), "stage2",
             lambda value: value.get("diagnosis_root_cause") in set(candidates),
+            case_id=case["case_id"],
         )
-        second = normalize_stage2(second_response["value"], candidates, first["preliminary_diagnosis"])
+        stage2_latency = time.monotonic() - stage2_started
+        stage2_after = dict(ledger.stages.get("stage2", {}))
+        _write_debug_response(args.debug_dir, "stage2", second_response.get("raw_text", ""))
+        second = normalize_stage2(second_response["value"], candidates, eps[0])
         predictions[case["case_id"]] = second["diagnosis_root_cause"]
+        stage1_delta = {key: stage1_after.get(key, 0) - stage1_before.get(key, 0) for key in
+                        ("calls", "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
+                         "reasoning_tokens", "unknown_usage_requests")}
+        stage2_delta = {key: stage2_after.get(key, 0) - stage2_before.get(key, 0) for key in
+                        ("calls", "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
+                         "reasoning_tokens", "unknown_usage_requests")}
+        # Retry counts are read after both stages; stage calls already include retries.
+        case_retry_calls = stage1_delta["calls"] + stage2_delta["calls"] - 2
+        if first_response["value"] is None:
+            case_status = "STAGE1_FAILED"
+        elif second_response["value"] is None:
+            case_status = "STAGE2_FAILED"
+        else:
+            case_status = "SUCCESS"
         record = {
             "case_id": case["case_id"], "endpoints": list(eps),
+            "status": case_status,
             "diagnosis_root_cause": second["diagnosis_root_cause"],
             "stage1_attempt": first_response["attempt"], "stage2_attempt": second_response["attempt"],
             "stage1_error": first_response["error"], "stage2_error": second_response["error"],
+            "stage1_parsed": first_response["value"] is not None,
+            "stage2_parsed": second_response["value"] is not None,
+            "stage1_input_tokens": stage1_delta["input_tokens"],
+            "stage1_output_tokens": stage1_delta["output_tokens"],
+            "stage2_input_tokens": stage2_delta["input_tokens"],
+            "stage2_output_tokens": stage2_delta["output_tokens"],
+            "input_tokens": stage1_delta["input_tokens"] + stage2_delta["input_tokens"],
+            "output_tokens": stage1_delta["output_tokens"] + stage2_delta["output_tokens"],
+            "total_tokens": stage1_delta["total_tokens"] + stage2_delta["total_tokens"],
+            "unknown_usage_requests": stage1_delta["unknown_usage_requests"] + stage2_delta["unknown_usage_requests"],
+            "api_calls": stage1_delta["calls"] + stage2_delta["calls"],
+            "retries": max(0, case_retry_calls),
+            "stage1_latency_seconds": round(stage1_latency, 3),
+            "stage2_latency_seconds": round(stage2_latency, 3),
+            "latency_seconds": round(time.monotonic() - case_started, 3),
         }
         normalized_records.append(record)
         _append_record(records_path, record)
         _write_usage(args.output_dir, ledger, len(predictions))
+
+    if args.no_evaluate:
+        _write_usage(args.output_dir, ledger, len(predictions))
+        _write_reliability_reports(args.output_dir, normalized_records, ledger, args.model, args.base_url)
+        print(f"API inference complete: cases={len(predictions)}, api_calls={ledger.as_dict()['overall']['calls']}")
+        return 0
 
     # No ground truth is read until every prediction in this selected run is fixed.
     truth = truth_after_predictions(cases)
@@ -486,13 +658,21 @@ def main() -> int:
     parser.add_argument("--split-dir", type=Path)
     parser.add_argument("--subset", choices=("train", "test", "all"), default="test")
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"))
+    parser.add_argument("--base-url", default=os.environ.get("CHATANYWHERE_BASE_URL") or os.environ.get("OPENAI_BASE_URL"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-output-tokens", type=int, default=256)
+    parser.add_argument("--timeout-seconds", type=float, help="legacy alias for read timeout")
+    parser.add_argument("--connect-timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--read-timeout-seconds", type=float, default=150.0)
+    parser.add_argument("--write-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--pool-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--debug-dir", type=Path)
     parser.add_argument("--reasoning-effort")
-    parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--no-evaluate", action="store_true", help="Do not reopen JSON labels or write an evaluated CSV")
     return run(parser.parse_args())
 
 

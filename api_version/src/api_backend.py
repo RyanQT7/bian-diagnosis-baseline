@@ -1,19 +1,61 @@
-"""OpenAI Responses API backend with bounded retries and usage accounting."""
+"""OpenAI-compatible Chat Completions backend with bounded retries and accounting."""
 from __future__ import annotations
 
 import json
 import math
 import os
+import random
+import time
 from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 
-def parse_json_object(text: str) -> dict[str, Any] | None:
-    """Parse a JSON object, tolerating a short surrounding explanation."""
+def _balanced_objects(text: str) -> list[str]:
+    objects: list[str] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start : index + 1])
+                start = None
+    return objects
+
+
+def parse_json_object(text: str, *, prefer_last: bool = False) -> dict[str, Any] | None:
+    """Parse JSON while tolerating a fence or short surrounding explanation."""
     text = (text or "").strip()
-    candidates = [text]
-    if "{" in text and "}" in text:
-        candidates.append(text[text.find("{") : text.rfind("}") + 1])
+    unfenced = text
+    fence = chr(96) * 3
+    if unfenced.startswith(fence):
+        lines = unfenced.splitlines()
+        if lines and lines[0].lstrip().startswith(fence):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == fence:
+            lines = lines[:-1]
+        unfenced = "\n".join(lines).strip()
+    candidates = [text, unfenced]
+    objects = _balanced_objects(unfenced)
+    candidates.extend(reversed(objects) if prefer_last else objects)
     for candidate in candidates:
         try:
             value = json.loads(candidate)
@@ -32,7 +74,7 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 def _integer(value: Any) -> int | None:
     try:
-        if value is None:
+        if value is None or isinstance(value, bool):
             return None
         number = int(value)
         return number if number >= 0 else None
@@ -40,14 +82,122 @@ def _integer(value: Any) -> int | None:
         return None
 
 
+def _usage_values(usage: Any) -> dict[str, int | bool]:
+    input_tokens = _integer(_field(usage, "input_tokens"))
+    if input_tokens is None:
+        input_tokens = _integer(_field(usage, "prompt_tokens"))
+    output_tokens = _integer(_field(usage, "output_tokens"))
+    if output_tokens is None:
+        output_tokens = _integer(_field(usage, "completion_tokens"))
+    total_tokens = _integer(_field(usage, "total_tokens"))
+    unknown = usage is None or input_tokens is None or output_tokens is None
+    input_value = input_tokens or 0
+    output_value = output_tokens or 0
+    total_value = total_tokens if total_tokens is not None else input_value + output_value
+    input_details = _field(usage, "input_tokens_details") or _field(usage, "prompt_tokens_details")
+    output_details = _field(usage, "output_tokens_details") or _field(usage, "completion_tokens_details")
+    cached_tokens = _integer(_field(input_details, "cached_tokens")) or 0
+    reasoning_tokens = _integer(_field(output_details, "reasoning_tokens")) or 0
+    return {
+        "input_tokens": input_value,
+        "output_tokens": output_value,
+        "total_tokens": total_value,
+        "cached_input_tokens": cached_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "unknown": unknown,
+    }
+
+
+def _exception_chain(error: Exception) -> list[BaseException]:
+    chain: list[BaseException] = []
+    pending: BaseException | None = error
+    seen: set[int] = set()
+    while pending is not None and id(pending) not in seen and len(chain) < 8:
+        chain.append(pending)
+        seen.add(id(pending))
+        pending = pending.__cause__ or pending.__context__
+    return chain
+
+
+def _http_status(error: Exception) -> int | None:
+    for item in _exception_chain(error):
+        status = _integer(getattr(item, "status_code", None))
+        if status is None:
+            status = _integer(_field(getattr(item, "response", None), "status_code"))
+        if status is not None:
+            return status
+    return None
+
+
+def classify_exception(error: Exception) -> str:
+    """Classify transport/provider errors without depending on SDK internals."""
+    status = _http_status(error)
+    if status == 429:
+        return "HTTP_429"
+    if status is not None and 500 <= status <= 599:
+        return "HTTP_5XX"
+    if status is not None and 400 <= status <= 499:
+        return "HTTP_4XX"
+    names = " ".join(type(item).__name__.lower() for item in _exception_chain(error))
+    if "pooltimeout" in names or "pool_timeout" in names:
+        return "POOL_TIMEOUT"
+    if "connecttimeout" in names or "connect_timeout" in names:
+        return "CONNECT_TIMEOUT"
+    if "writetimeout" in names or "write_timeout" in names:
+        return "WRITE_TIMEOUT"
+    if "readtimeout" in names or "read_timeout" in names:
+        return "READ_TIMEOUT"
+    if "apitimeout" in names or "timeout" in names:
+        return "TOTAL_TIMEOUT"
+    if "connectionerror" in names or "connection" in names:
+        return "CONNECT_ERROR"
+    return "OTHER"
+
+
+def _retryable(category: str) -> bool:
+    return category in {
+        "CONNECT_TIMEOUT", "READ_TIMEOUT", "WRITE_TIMEOUT", "POOL_TIMEOUT",
+        "TOTAL_TIMEOUT", "CONNECT_ERROR", "HTTP_429", "HTTP_5XX",
+        "UPSTREAM_ERROR", "EMPTY_RESPONSE", "TRUNCATED_RESPONSE",
+    }
+
+
+def _text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "value"):
+            result = _text_value(value.get(key))
+            if result:
+                return result
+    return ""
+
+
 class UsageLedger:
-    """Accumulate usage returned by the API without storing credentials."""
+    """Accumulate provider usage and distinguish unknown usage from zero."""
 
     def __init__(self) -> None:
         self.stages: dict[str, dict[str, int]] = defaultdict(
-            lambda: {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "usage_missing": 0}
+            lambda: {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+                "unknown_usage_requests": 0,
+                "usage_missing": 0,
+            }
         )
-        self.retries = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        self.retries = {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "unknown_usage_requests": 0,
+        }
         self.failed_calls = 0
 
     @classmethod
@@ -57,10 +207,17 @@ class UsageLedger:
             return ledger
         for stage, stats in value.get("stages", {}).items():
             if isinstance(stats, dict):
-                ledger.stages[stage].update({key: int(stats.get(key, 0) or 0) for key in ledger.stages[stage]})
+                for key in ledger.stages[stage]:
+                    parsed = _integer(stats.get(key, 0))
+                    ledger.stages[stage][key] = parsed or 0
         if isinstance(value.get("retries"), dict):
-            ledger.retries.update({key: int(value["retries"].get(key, 0) or 0) for key in ledger.retries})
-        ledger.failed_calls = int(value.get("failed_calls", 0) or 0)
+            for key in ledger.retries:
+                parsed = _integer(value["retries"].get(key, 0))
+                ledger.retries[key] = parsed or 0
+        overall = value.get("overall", {})
+        ledger.failed_calls = _integer(
+            value.get("failed_calls", overall.get("failed_calls", 0) if isinstance(overall, dict) else 0)
+        ) or 0
         return ledger
 
     def record(self, stage: str, usage: Any, *, retry: bool = False, failed: bool = False) -> None:
@@ -68,44 +225,45 @@ class UsageLedger:
         stats["calls"] += 1
         if failed:
             self.failed_calls += 1
-        input_tokens = _integer(_field(usage, "input_tokens"))
-        output_tokens = _integer(_field(usage, "output_tokens"))
-        total_tokens = _integer(_field(usage, "total_tokens"))
-        if input_tokens is None or output_tokens is None:
+        values = _usage_values(usage)
+        if values["unknown"]:
+            stats["unknown_usage_requests"] += 1
             stats["usage_missing"] += 1
-        input_tokens = input_tokens or 0
-        output_tokens = output_tokens or 0
-        total_tokens = total_tokens if total_tokens is not None else input_tokens + output_tokens
-        stats["input_tokens"] += input_tokens
-        stats["output_tokens"] += output_tokens
-        stats["total_tokens"] += total_tokens
+        for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
+            stats[key] += int(values[key])
         if retry:
             self.retries["calls"] += 1
-            self.retries["input_tokens"] += input_tokens
-            self.retries["output_tokens"] += output_tokens
-            self.retries["total_tokens"] += total_tokens
+            for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
+                self.retries[key] += int(values[key])
+            if values["unknown"]:
+                self.retries["unknown_usage_requests"] += 1
 
     def as_dict(self, completed_cases: int | None = None) -> dict[str, Any]:
         stages = {stage: dict(stats) for stage, stats in sorted(self.stages.items())}
-        total = {key: 0 for key in ("calls", "input_tokens", "output_tokens", "total_tokens")}
+        aggregate_keys = (
+            "calls", "input_tokens", "output_tokens", "total_tokens",
+            "cached_input_tokens", "reasoning_tokens", "unknown_usage_requests", "usage_missing",
+        )
+        total = {key: 0 for key in aggregate_keys}
         for stats in stages.values():
-            for key in total:
-                total[key] += stats[key]
+            for key in aggregate_keys:
+                total[key] += stats.get(key, 0)
         result: dict[str, Any] = {
             "stages": stages,
             "retries": dict(self.retries),
             "overall": {**total, "failed_calls": self.failed_calls},
-            "usage_source": "API response usage fields; missing values are reported, not inferred",
+            "usage_source": "API response usage fields; timeout/transport usage is unknown, not zero-consumed",
         }
         if completed_cases is not None and completed_cases > 0:
             result["average_per_case"] = {
-                key: total[key] / completed_cases for key in ("input_tokens", "output_tokens", "total_tokens")
+                key: total[key] / completed_cases
+                for key in ("input_tokens", "output_tokens", "total_tokens")
             }
         return result
 
 
 class OpenAIResponsesBackend:
-    """One Responses API request per stage, with at most ``max_retries`` retries."""
+    """OpenAI-compatible Chat Completions backend with one reusable client."""
 
     def __init__(
         self,
@@ -114,13 +272,29 @@ class OpenAIResponsesBackend:
         max_retries: int,
         reasoning_effort: str | None,
         ledger: UsageLedger,
+        base_url: str | None = None,
+        timeout_seconds: float = 120.0,
+        connect_timeout_seconds: float = 20.0,
+        read_timeout_seconds: float | None = None,
+        write_timeout_seconds: float = 60.0,
+        pool_timeout_seconds: float = 30.0,
+        request_log_path: Path | None = None,
     ) -> None:
         self.model = model
         self.max_output_tokens = max_output_tokens
-        self.max_retries = min(max(0, max_retries), 2)
+        self.max_transport_retries = min(max(0, max_retries), 1)
+        self.max_format_retries = min(max(0, max_retries), 1)
         self.reasoning_effort = reasoning_effort
         self.ledger = ledger
+        self.base_url = base_url
+        self.timeout_seconds = timeout_seconds
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.read_timeout_seconds = read_timeout_seconds if read_timeout_seconds is not None else timeout_seconds
+        self.write_timeout_seconds = write_timeout_seconds
+        self.pool_timeout_seconds = pool_timeout_seconds
+        self.request_log_path = request_log_path
         self._client: Any = None
+        self._random = random.Random(42)
 
     @property
     def client(self) -> Any:
@@ -129,59 +303,86 @@ class OpenAIResponsesBackend:
                 raise RuntimeError("OPENAI_API_KEY is not set")
             from openai import OpenAI
 
-            self._client = OpenAI()
+            kwargs: dict[str, Any] = {
+                "api_key": os.environ["OPENAI_API_KEY"],
+                "max_retries": 0,
+            }
+            selected_base_url = self.base_url or os.environ.get("CHATANYWHERE_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+            if selected_base_url:
+                kwargs["base_url"] = selected_base_url.rstrip("/")
+            try:
+                import httpx
+                kwargs["timeout"] = httpx.Timeout(
+                    connect=self.connect_timeout_seconds,
+                    read=self.read_timeout_seconds,
+                    write=self.write_timeout_seconds,
+                    pool=self.pool_timeout_seconds,
+                )
+            except ImportError:
+                kwargs["timeout"] = self.read_timeout_seconds
+            # ChatAnywhere/DeepSeek compatibility: no optional reasoning_effort
+            # or provider-specific JSON-schema parameter is sent.
+            self._client = OpenAI(**kwargs)
         return self._client
 
     def _create(self, prompt: str, schema: dict[str, Any]) -> Any:
-        format_name = str(schema.get("title", "bian_diagnosis")).lower().replace(" ", "_")[:64]
-        schema_body = {key: value for key, value in schema.items() if key != "title"}
+        del schema
         payload: dict[str, Any] = {
             "model": self.model,
-            "input": prompt,
-            "max_output_tokens": self.max_output_tokens,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": format_name,
-                    "strict": True,
-                    "schema": schema_body,
-                }
-            },
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_output_tokens,
+            "response_format": {"type": "json_object"},
         }
-        if self.reasoning_effort:
-            payload["reasoning"] = {"effort": self.reasoning_effort}
-        try:
-            return self.client.responses.create(**payload)
-        except Exception:
-            # Some non-reasoning models reject the optional reasoning object. Retry
-            # that request without the optional parameter; all normal retries remain bounded.
-            if self.reasoning_effort and "reasoning" in payload:
-                payload.pop("reasoning")
-                return self.client.responses.create(**payload)
-            raise
+        return self.client.chat.completions.create(**payload)
 
     @staticmethod
-    def _response_text(response: Any) -> str:
-        text = getattr(response, "output_text", None)
-        if isinstance(text, str) and text.strip():
-            return text
-        output = getattr(response, "output", None)
-        if isinstance(output, list):
-            parts: list[str] = []
-            for item in output:
-                content = _field(item, "content", [])
-                if isinstance(content, list):
-                    for part in content:
-                        part_text = _field(part, "text")
-                        if isinstance(part_text, str):
-                            parts.append(part_text)
-            return "\n".join(parts)
-        return ""
+    def _response_text(response: Any) -> tuple[str, bool]:
+        if isinstance(response, str):
+            return response, False
+        choices = _field(response, "choices", [])
+        if isinstance(choices, list) and choices:
+            message = _field(choices[0], "message", {})
+            content = _text_value(_field(message, "content", ""))
+            if content.strip():
+                return content, False
+            reasoning = _text_value(
+                _field(message, "reasoning_content", _field(message, "reasoning", ""))
+            )
+            if reasoning.strip():
+                return reasoning, True
+            choice_text = _text_value(_field(choices[0], "text", ""))
+            if choice_text.strip():
+                return choice_text, False
+        return "", False
+
+    @staticmethod
+    def _finish_reason(response: Any) -> str | None:
+        choices = _field(response, "choices", [])
+        if isinstance(choices, list) and choices:
+            value = _field(choices[0], "finish_reason")
+            return str(value) if value is not None else None
+        return None
 
     @staticmethod
     def _safe_error(error: Exception) -> str:
-        text = str(error).replace(os.environ.get("OPENAI_API_KEY", ""), "[redacted]")
+        text = str(error)
+        key = os.environ.get("OPENAI_API_KEY", "")
+        if key:
+            text = text.replace(key, "[redacted]")
         return text[:500] or error.__class__.__name__
+
+    def _append_request_log(self, payload: dict[str, Any]) -> None:
+        if self.request_log_path is None:
+            return
+        self.request_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.request_log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _backoff(self, retry_number: int) -> None:
+        base = 2.0 if retry_number <= 1 else 5.0
+        time.sleep(base + self._random.random())
 
     def request_json(
         self,
@@ -189,21 +390,127 @@ class OpenAIResponsesBackend:
         schema: dict[str, Any],
         stage: str,
         validator: Callable[[dict[str, Any]], bool],
+        *,
+        case_id: str | None = None,
     ) -> dict[str, Any]:
         errors: list[str] = []
-        for attempt in range(self.max_retries + 1):
+        last_raw_text = ""
+        last_category: str | None = None
+        last_finish_reason: str | None = None
+        transport_retries = 0
+        format_retries = 0
+        attempt = 0
+        while True:
+            attempt += 1
+            request_start = time.monotonic()
+            start_time = datetime.now(timezone.utc).isoformat()
+            retry_kind = "initial" if attempt == 1 else (
+                "format" if format_retries and transport_retries == 0 else "transport_or_format"
+            )
             request_prompt = prompt
-            if attempt:
-                request_prompt += "\nReturn one corrected JSON object matching the schema. Do not add prose."
+            if format_retries:
+                request_prompt += (
+                    "\nReturn ONLY one valid JSON object matching the requested fields. "
+                    "Do not include markdown, code fences, or explanation."
+                )
             try:
                 response = self._create(request_prompt, schema)
-                self.ledger.record(stage, getattr(response, "usage", None), retry=attempt > 0)
-                raw_text = self._response_text(response)
-                value = parse_json_object(raw_text)
-                if value is not None and validator(value):
-                    return {"value": value, "attempt": attempt + 1, "error": None}
-                errors.append("JSON parse or schema-value validation failure")
-            except Exception as error:  # API errors are recorded and retried a bounded number of times.
-                self.ledger.record(stage, None, retry=attempt > 0, failed=True)
-                errors.append(self._safe_error(error))
-        return {"value": None, "attempt": self.max_retries + 1, "error": "; ".join(errors[-2:])}
+                latency = time.monotonic() - request_start
+                usage = _field(response, "usage")
+                self.ledger.record(stage, usage, retry=attempt > 1)
+                raw_text, from_reasoning = self._response_text(response)
+                last_raw_text = raw_text
+                finish_reason = self._finish_reason(response)
+                last_finish_reason = finish_reason
+                value = parse_json_object(raw_text, prefer_last=from_reasoning)
+                category: str | None = None
+                if not raw_text.strip():
+                    category = "EMPTY_RESPONSE"
+                elif finish_reason == "length" and value is None:
+                    category = "TRUNCATED_RESPONSE"
+                elif value is None:
+                    category = "JSON_PARSE_ERROR"
+                elif not validator(value):
+                    if stage == "stage2" and "diagnosis_root_cause" in value:
+                        category = "INVALID_CANDIDATE"
+                    else:
+                        category = "SCHEMA_VALIDATION_ERROR"
+                values = _usage_values(usage)
+                self._append_request_log({
+                    "case_id": case_id,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "retry_kind": retry_kind,
+                    "start_time": start_time,
+                    "latency_seconds": round(latency, 3),
+                    "status": "SUCCESS" if category is None else "INVALID_OUTPUT",
+                    "error_category": category,
+                    "exception_type": None,
+                    "http_status": 200,
+                    "finish_reason": finish_reason,
+                    "input_tokens": values["input_tokens"],
+                    "output_tokens": values["output_tokens"],
+                    "total_tokens": values["total_tokens"],
+                    "usage_unknown": values["unknown"],
+                })
+                if category is None:
+                    return {
+                        "value": value,
+                        "attempt": attempt,
+                        "error": None,
+                        "raw_text": raw_text,
+                        "error_category": None,
+                        "finish_reason": finish_reason,
+                    }
+                last_category = category
+                errors.append(category)
+                if category in {
+                    "EMPTY_RESPONSE", "TRUNCATED_RESPONSE", "JSON_PARSE_ERROR",
+                    "SCHEMA_VALIDATION_ERROR", "INVALID_CANDIDATE",
+                } and format_retries < self.max_format_retries:
+                    format_retries += 1
+                    continue
+                return {
+                    "value": None,
+                    "attempt": attempt,
+                    "error": "; ".join(errors[-2:]),
+                    "raw_text": last_raw_text,
+                    "error_category": last_category,
+                    "finish_reason": last_finish_reason,
+                }
+            except Exception as error:
+                latency = time.monotonic() - request_start
+                category = classify_exception(error)
+                last_category = category
+                errors.append(f"{category}: {self._safe_error(error)}")
+                self.ledger.record(stage, None, retry=attempt > 1, failed=True)
+                self._append_request_log({
+                    "case_id": case_id,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "retry_kind": retry_kind,
+                    "start_time": start_time,
+                    "latency_seconds": round(latency, 3),
+                    "status": "FAILED",
+                    "error_category": category,
+                    "exception_type": error.__class__.__name__,
+                    "http_status": _http_status(error),
+                    "finish_reason": None,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "usage_unknown": True,
+                    "error": self._safe_error(error),
+                })
+                if _retryable(category) and transport_retries < self.max_transport_retries:
+                    transport_retries += 1
+                    self._backoff(transport_retries)
+                    continue
+                return {
+                    "value": None,
+                    "attempt": attempt,
+                    "error": "; ".join(errors[-2:]),
+                    "raw_text": last_raw_text,
+                    "error_category": last_category,
+                    "finish_reason": last_finish_reason,
+                }

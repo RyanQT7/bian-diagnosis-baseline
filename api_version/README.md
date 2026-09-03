@@ -3,7 +3,7 @@
 This directory is an API-backed version of the case-native endpoint BiAn
 baseline. It keeps the two-stage preprocessing and structured diagnosis from
 the native-endpoint implementation, while replacing local 32B inference with
-the official OpenAI Python SDK Responses API.
+an OpenAI-compatible Chat Completions API.
 
 Candidates are discovered independently for each case from
 `link_side_ip_interface_map.keys()` plus `fiber`. Endpoint names are preserved
@@ -17,10 +17,13 @@ fixed for evaluation.
 python3 -m pip install -r requirements.txt
 export OPENAI_API_KEY="..."
 export OPENAI_MODEL="<model-name>"
+export CHATANYWHERE_BASE_URL="https://api.chatanywhere.tech/v1"
 ```
 
 The key is read only from `OPENAI_API_KEY`; it is never written to source,
 logs, or result files. Choose the model with `--model` or `OPENAI_MODEL`.
+The OpenAI-compatible host can be selected with `--base-url` or
+`CHATANYWHERE_BASE_URL` (the two ChatAnywhere hosts are not hard-coded).
 
 ## Dry-run
 
@@ -47,14 +50,22 @@ python3 run_experiment.py \
   --split-dir /path/to/results/time_split_20251001 \
   --subset test \
   --model "$OPENAI_MODEL" \
-  --output-dir /path/to/results/bian-api/test
+  --output-dir /path/to/results/bian-api/test \
+  --base-url "$CHATANYWHERE_BASE_URL"
 ```
 
-`--max-output-tokens`, optional `--reasoning-effort`, bounded
-`--max-retries` (capped at 2), `--resume`, and `--limit` are supported. A run
-writes predictions, scores, resumable records, and actual API usage totals to
-the selected output directory. Usage includes Stage 1, Stage 2, retries, and
-overall input/output/total tokens.
+`--max-output-tokens`, `--connect-timeout-seconds`,
+`--read-timeout-seconds`, `--write-timeout-seconds`,
+`--pool-timeout-seconds`, bounded `--max-retries` (one transport and one
+format retry at most), `--resume`, and `--limit` are supported. The client
+uses one connection pool per run and disables SDK-level automatic retries.
+`response_format=json_object` is the only structured-output request option;
+schema validation and JSON recovery are local for provider compatibility.
+The default timeout budget is connect 20s, read 150s, write 60s, and pool
+30s. A run writes predictions, scores, resumable records, request metadata,
+and actual API usage totals to the selected output directory. Usage includes
+known Stage 1/Stage 2 tokens, retries, and requests whose usage is unknown
+after a transport failure.
 
 This version is implementation-only in the current experiment; no full API
 run is started automatically.

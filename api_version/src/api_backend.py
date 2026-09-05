@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -173,10 +174,40 @@ def _text_value(value: Any) -> str:
     return ""
 
 
+class RequestStartLimiter:
+    """Serialize request starts with an optional minimum interval."""
+
+    def __init__(self, interval_seconds: float = 0.0, jitter_seconds: float = 0.0) -> None:
+        if interval_seconds < 0 or jitter_seconds < 0:
+            raise ValueError("request pacing values must be non-negative")
+        self.interval_seconds = float(interval_seconds)
+        self.jitter_seconds = float(jitter_seconds)
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self._random = random.Random(42)
+
+    def wait(self) -> None:
+        if self.interval_seconds <= 0:
+            return
+        # Holding the lock through the sleep makes the release immediately
+        # precede the request start for the current worker.  Later workers
+        # reserve their start only after that release.
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_allowed - now)
+            if delay:
+                time.sleep(delay)
+            gap = self.interval_seconds
+            if self.jitter_seconds:
+                gap += self._random.uniform(0.0, self.jitter_seconds)
+            self._next_allowed = time.monotonic() + gap
+
+
 class UsageLedger:
     """Accumulate provider usage and distinguish unknown usage from zero."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.stages: dict[str, dict[str, int]] = defaultdict(
             lambda: {
                 "calls": 0,
@@ -221,25 +252,29 @@ class UsageLedger:
         return ledger
 
     def record(self, stage: str, usage: Any, *, retry: bool = False, failed: bool = False) -> None:
-        stats = self.stages[stage]
-        stats["calls"] += 1
-        if failed:
-            self.failed_calls += 1
-        values = _usage_values(usage)
-        if values["unknown"]:
-            stats["unknown_usage_requests"] += 1
-            stats["usage_missing"] += 1
-        for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
-            stats[key] += int(values[key])
-        if retry:
-            self.retries["calls"] += 1
-            for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
-                self.retries[key] += int(values[key])
+        with self._lock:
+            stats = self.stages[stage]
+            stats["calls"] += 1
+            if failed:
+                self.failed_calls += 1
+            values = _usage_values(usage)
             if values["unknown"]:
-                self.retries["unknown_usage_requests"] += 1
+                stats["unknown_usage_requests"] += 1
+                stats["usage_missing"] += 1
+            for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
+                stats[key] += int(values[key])
+            if retry:
+                self.retries["calls"] += 1
+                for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
+                    self.retries[key] += int(values[key])
+                if values["unknown"]:
+                    self.retries["unknown_usage_requests"] += 1
 
     def as_dict(self, completed_cases: int | None = None) -> dict[str, Any]:
-        stages = {stage: dict(stats) for stage, stats in sorted(self.stages.items())}
+        with self._lock:
+            stages = {stage: dict(stats) for stage, stats in sorted(self.stages.items())}
+            retries = dict(self.retries)
+            failed_calls = self.failed_calls
         aggregate_keys = (
             "calls", "input_tokens", "output_tokens", "total_tokens",
             "cached_input_tokens", "reasoning_tokens", "unknown_usage_requests", "usage_missing",
@@ -250,8 +285,8 @@ class UsageLedger:
                 total[key] += stats.get(key, 0)
         result: dict[str, Any] = {
             "stages": stages,
-            "retries": dict(self.retries),
-            "overall": {**total, "failed_calls": self.failed_calls},
+            "retries": retries,
+            "overall": {**total, "failed_calls": failed_calls},
             "usage_source": "API response usage fields; timeout/transport usage is unknown, not zero-consumed",
         }
         if completed_cases is not None and completed_cases > 0:
@@ -260,6 +295,18 @@ class UsageLedger:
                 for key in ("input_tokens", "output_tokens", "total_tokens")
             }
         return result
+
+    def merge(self, other: "UsageLedger") -> None:
+        """Merge one case-local ledger into this run ledger."""
+        snapshot = other.as_dict()
+        with self._lock:
+            for stage, stats in snapshot.get("stages", {}).items():
+                target = self.stages[stage]
+                for key in target:
+                    target[key] += int(stats.get(key, 0))
+            for key in self.retries:
+                self.retries[key] += int(snapshot.get("retries", {}).get(key, 0))
+            self.failed_calls += int(snapshot.get("overall", {}).get("failed_calls", 0))
 
 
 class OpenAIResponsesBackend:
@@ -271,6 +318,7 @@ class OpenAIResponsesBackend:
         max_output_tokens: int,
         max_retries: int,
         reasoning_effort: str | None,
+        thinking_mode: str | None,
         ledger: UsageLedger,
         base_url: str | None = None,
         timeout_seconds: float = 120.0,
@@ -279,12 +327,18 @@ class OpenAIResponsesBackend:
         write_timeout_seconds: float = 60.0,
         pool_timeout_seconds: float = 30.0,
         request_log_path: Path | None = None,
+        request_start_interval_seconds: float = 0.0,
+        request_start_jitter_seconds: float = 0.0,
+        structured_output_mode: str = "json-object",
     ) -> None:
         self.model = model
         self.max_output_tokens = max_output_tokens
         self.max_transport_retries = min(max(0, max_retries), 1)
         self.max_format_retries = min(max(0, max_retries), 1)
         self.reasoning_effort = reasoning_effort
+        if thinking_mode not in {None, "default", "disabled"}:
+            raise ValueError("thinking_mode must be default, disabled, or None")
+        self.thinking_mode = None if thinking_mode in {None, "default"} else thinking_mode
         self.ledger = ledger
         self.base_url = base_url
         self.timeout_seconds = timeout_seconds
@@ -292,47 +346,74 @@ class OpenAIResponsesBackend:
         self.read_timeout_seconds = read_timeout_seconds if read_timeout_seconds is not None else timeout_seconds
         self.write_timeout_seconds = write_timeout_seconds
         self.pool_timeout_seconds = pool_timeout_seconds
+        if structured_output_mode not in {"prompt-json", "json-object"}:
+            raise ValueError("structured_output_mode must be prompt-json or json-object")
+        self.structured_output_mode = structured_output_mode
         self.request_log_path = request_log_path
+        self._request_start_limiter = RequestStartLimiter(
+            request_start_interval_seconds, request_start_jitter_seconds
+        )
         self._client: Any = None
+        self._client_lock = threading.Lock()
+        self._log_lock = threading.Lock()
         self._random = random.Random(42)
 
     @property
     def client(self) -> Any:
         if self._client is None:
-            if not os.environ.get("OPENAI_API_KEY"):
-                raise RuntimeError("OPENAI_API_KEY is not set")
-            from openai import OpenAI
+            with self._client_lock:
+                if self._client is None:
+                    if not os.environ.get("OPENAI_API_KEY"):
+                        raise RuntimeError("OPENAI_API_KEY is not set")
+                    from openai import OpenAI
 
-            kwargs: dict[str, Any] = {
-                "api_key": os.environ["OPENAI_API_KEY"],
-                "max_retries": 0,
-            }
-            selected_base_url = self.base_url or os.environ.get("CHATANYWHERE_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-            if selected_base_url:
-                kwargs["base_url"] = selected_base_url.rstrip("/")
-            try:
-                import httpx
-                kwargs["timeout"] = httpx.Timeout(
-                    connect=self.connect_timeout_seconds,
-                    read=self.read_timeout_seconds,
-                    write=self.write_timeout_seconds,
-                    pool=self.pool_timeout_seconds,
-                )
-            except ImportError:
-                kwargs["timeout"] = self.read_timeout_seconds
-            # ChatAnywhere/DeepSeek compatibility: no optional reasoning_effort
-            # or provider-specific JSON-schema parameter is sent.
-            self._client = OpenAI(**kwargs)
+                    kwargs: dict[str, Any] = {
+                        "api_key": os.environ["OPENAI_API_KEY"],
+                        "max_retries": 0,
+                    }
+                    selected_base_url = self.base_url or os.environ.get("CHATANYWHERE_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+                    if selected_base_url:
+                        kwargs["base_url"] = selected_base_url.rstrip("/")
+                    try:
+                        import httpx
+                        timeout = httpx.Timeout(
+                            connect=self.connect_timeout_seconds,
+                            read=self.read_timeout_seconds,
+                            write=self.write_timeout_seconds,
+                            pool=self.pool_timeout_seconds,
+                        )
+                        kwargs["timeout"] = timeout
+                        # The API subprocess must not inherit the Codex
+                        # session's proxy.  Keep this explicit in addition
+                        # to the direct launcher so embedded callers are
+                        # direct as well.
+                        kwargs["http_client"] = httpx.Client(
+                            timeout=timeout, trust_env=False, follow_redirects=True
+                        )
+                    except ImportError:
+                        kwargs["timeout"] = self.read_timeout_seconds
+                    # ChatAnywhere/DeepSeek compatibility: no optional reasoning_effort
+                    # or provider-specific JSON-schema parameter is sent.
+                    self._client = OpenAI(**kwargs)
         return self._client
 
-    def _create(self, prompt: str, schema: dict[str, Any]) -> Any:
+    def _create(
+        self,
+        prompt: str,
+        schema: dict[str, Any],
+        max_output_tokens: int | None = None,
+    ) -> Any:
         del schema
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": self.max_output_tokens,
-            "response_format": {"type": "json_object"},
+            "max_tokens": max_output_tokens if max_output_tokens is not None else self.max_output_tokens,
         }
+        if self.structured_output_mode == "json-object":
+            payload["response_format"] = {"type": "json_object"}
+        if self.thinking_mode == "disabled":
+            # ChatAnywhere/DeepSeek-specific extra body; omitted in default mode.
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
         return self.client.chat.completions.create(**payload)
 
     @staticmethod
@@ -356,6 +437,21 @@ class OpenAIResponsesBackend:
         return "", False
 
     @staticmethod
+    def _reasoning_metadata(response: Any) -> dict[str, bool]:
+        """Record provider-visible reasoning fields without persisting their text."""
+        choices = _field(response, "choices", [])
+        if not isinstance(choices, list) or not choices:
+            return {"reasoning_content_present": False, "reasoning_content_nonempty": False}
+        message = _field(choices[0], "message", {})
+        marker = _field(message, "reasoning_content", None)
+        if marker is None:
+            marker = _field(message, "reasoning", None)
+        return {
+            "reasoning_content_present": marker is not None,
+            "reasoning_content_nonempty": bool(_text_value(marker).strip()),
+        }
+
+    @staticmethod
     def _finish_reason(response: Any) -> str | None:
         choices = _field(response, "choices", [])
         if isinstance(choices, list) and choices:
@@ -374,11 +470,12 @@ class OpenAIResponsesBackend:
     def _append_request_log(self, payload: dict[str, Any]) -> None:
         if self.request_log_path is None:
             return
-        self.request_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.request_log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        with self._log_lock:
+            self.request_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.request_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
     def _backoff(self, retry_number: int) -> None:
         base = 2.0 if retry_number <= 1 else 5.0
@@ -392,6 +489,8 @@ class OpenAIResponsesBackend:
         validator: Callable[[dict[str, Any]], bool],
         *,
         case_id: str | None = None,
+        max_output_tokens: int | None = None,
+        ledger: UsageLedger | None = None,
     ) -> dict[str, Any]:
         errors: list[str] = []
         last_raw_text = ""
@@ -402,6 +501,7 @@ class OpenAIResponsesBackend:
         attempt = 0
         while True:
             attempt += 1
+            self._request_start_limiter.wait()
             request_start = time.monotonic()
             start_time = datetime.now(timezone.utc).isoformat()
             retry_kind = "initial" if attempt == 1 else (
@@ -414,20 +514,23 @@ class OpenAIResponsesBackend:
                     "Do not include markdown, code fences, or explanation."
                 )
             try:
-                response = self._create(request_prompt, schema)
+                response = self._create(request_prompt, schema, max_output_tokens)
                 latency = time.monotonic() - request_start
                 usage = _field(response, "usage")
-                self.ledger.record(stage, usage, retry=attempt > 1)
+                (ledger or self.ledger).record(stage, usage, retry=attempt > 1)
                 raw_text, from_reasoning = self._response_text(response)
+                reasoning_metadata = self._reasoning_metadata(response)
                 last_raw_text = raw_text
                 finish_reason = self._finish_reason(response)
                 last_finish_reason = finish_reason
                 value = parse_json_object(raw_text, prefer_last=from_reasoning)
                 category: str | None = None
-                if not raw_text.strip():
+                if finish_reason == "length":
+                    # A generation cap is deterministic for this request; do
+                    # not spend another call retrying the same capped payload.
+                    category = "OUTPUT_LIMIT_EXCEEDED"
+                elif not raw_text.strip():
                     category = "EMPTY_RESPONSE"
-                elif finish_reason == "length" and value is None:
-                    category = "TRUNCATED_RESPONSE"
                 elif value is None:
                     category = "JSON_PARSE_ERROR"
                 elif not validator(value):
@@ -451,6 +554,9 @@ class OpenAIResponsesBackend:
                     "input_tokens": values["input_tokens"],
                     "output_tokens": values["output_tokens"],
                     "total_tokens": values["total_tokens"],
+                    "cached_input_tokens": values["cached_input_tokens"],
+                    "reasoning_tokens": values["reasoning_tokens"],
+                    **reasoning_metadata,
                     "usage_unknown": values["unknown"],
                 })
                 if category is None:
@@ -483,7 +589,7 @@ class OpenAIResponsesBackend:
                 category = classify_exception(error)
                 last_category = category
                 errors.append(f"{category}: {self._safe_error(error)}")
-                self.ledger.record(stage, None, retry=attempt > 1, failed=True)
+                (ledger or self.ledger).record(stage, None, retry=attempt > 1, failed=True)
                 self._append_request_log({
                     "case_id": case_id,
                     "stage": stage,
@@ -499,6 +605,10 @@ class OpenAIResponsesBackend:
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "total_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "reasoning_content_present": False,
+                    "reasoning_content_nonempty": False,
                     "usage_unknown": True,
                     "error": self._safe_error(error),
                 })

@@ -54,7 +54,12 @@ python3 run_experiment.py \
   --base-url "$CHATANYWHERE_BASE_URL"
 ```
 
-`--max-output-tokens`, `--connect-timeout-seconds`,
+`--max-output-tokens` (default 8192), optional
+`--stage1-max-output-tokens`/`--stage2-max-output-tokens`,
+`--structured-output prompt-json|json-object` (the default preserves the
+provider JSON-object request), and `--schema-profile compact|local32b`
+(`local32b` mirrors the final local vLLM response fields),
+`--workers` (default 1, supported range 1--3), `--connect-timeout-seconds`,
 `--read-timeout-seconds`, `--write-timeout-seconds`,
 `--pool-timeout-seconds`, bounded `--max-retries` (one transport and one
 format retry at most), `--resume`, and `--limit` are supported. The client

@@ -8,6 +8,7 @@ import math
 import os
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -207,7 +208,60 @@ def summarize_case(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def stage1_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+def _local32b_stage1_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+    directions = [f"{source}->{target}" for source in endpoints for target in endpoints if source != target]
+    return {
+        "title": "bian_stage1",
+        "type": "object",
+        "properties": {
+            "endpoint_observations": {"type": "array", "items": {"type": "object", "properties": {
+                "endpoint": {"type": "string", "enum": list(endpoints)},
+                "observations": {"type": "string"},
+            }, "required": ["endpoint", "observations"], "additionalProperties": False}},
+            "directional_links": {"type": "array", "items": {"type": "object", "properties": {
+                "direction": {"type": "string", "enum": directions},
+                "observations": {"type": "string"},
+            }, "required": ["direction", "observations"], "additionalProperties": False}},
+            "cross_endpoint_comparison": {"type": "string"},
+            "data_quality": {"type": "string"},
+            "notable_inconsistencies": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["endpoint_observations", "directional_links", "cross_endpoint_comparison",
+                      "data_quality", "notable_inconsistencies"],
+        "additionalProperties": False,
+    }
+
+
+def _local32b_stage2_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+    candidates = [*endpoints, "fiber"]
+    comparison_item = {
+        "type": "object",
+        "properties": {
+            "candidate": {"type": "string", "enum": candidates},
+            "supporting_observations": {"type": "string"},
+            "contradictory_observations": {"type": "string"},
+            "unexplained_observations": {"type": "string"},
+        },
+        "required": ["candidate", "supporting_observations", "contradictory_observations",
+                      "unexplained_observations"],
+        "additionalProperties": False,
+    }
+    return {
+        "title": "bian_stage2",
+        "type": "object",
+        "properties": {
+            "candidate_comparison": {"type": "array", "items": comparison_item},
+            "diagnosis_root_cause": {"type": "string", "enum": candidates},
+            "reason": {"type": "string"},
+        },
+        "required": ["candidate_comparison", "diagnosis_root_cause", "reason"],
+        "additionalProperties": False,
+    }
+
+
+def stage1_schema(endpoints: tuple[str, ...], profile: str = "compact") -> dict[str, Any]:
+    if profile == "local32b":
+        return _local32b_stage1_schema(endpoints)
     endpoint_properties = {endpoint: {"type": "string"} for endpoint in endpoints}
     return {
         "title": "bian_stage1",
@@ -224,7 +278,9 @@ def stage1_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
     }
 
 
-def stage2_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
+def stage2_schema(endpoints: tuple[str, ...], profile: str = "compact") -> dict[str, Any]:
+    if profile == "local32b":
+        return _local32b_stage2_schema(endpoints)
     return {
         "title": "bian_stage2",
         "type": "object",
@@ -238,8 +294,23 @@ def stage2_schema(endpoints: tuple[str, ...]) -> dict[str, Any]:
     }
 
 
-def stage1_prompt(summary: dict[str, Any]) -> str:
+def stage1_prompt(summary: dict[str, Any], profile: str = "compact") -> str:
     candidates = ", ".join(summary["candidate_diagnoses"])
+    if profile == "local32b":
+        return (
+            "BiAn Stage 1 is objective evidence extraction for one optical-link case. "
+            f"Keep native endpoint identifiers exactly: {', '.join(summary['endpoints'])}; never rename them. "
+            "Do not output a diagnosis in Stage 1. Summarize observed endpoint facts and each native directional link "
+            "concisely, including lane pattern, missingness, status, cross-endpoint differences, and inconsistencies. "
+            "Lane-keyed values are spatial observations, not a time series. Null is unavailable; do not invent values "
+            "or threshold decisions. Return ONLY the required JSON object, without markdown, code fences, repeated input, "
+            "chain-of-thought, or text outside JSON. Keep each text field to one or two short sentences.\n"
+            "Use exactly these Stage 1 fields: endpoint_observations (array of endpoint/observations objects), "
+            "directional_links (array of direction/observations objects), cross_endpoint_comparison, data_quality, "
+            "and notable_inconsistencies (array of strings).\n"
+            + SOP_SOFT_PRIOR + "\nOBSERVABLE_SUMMARY:\n"
+            + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        )
     return (
         "BiAn Stage 1: extract physical evidence using the native endpoint identifiers exactly as provided. "
         f"Candidate diagnoses for THIS case: {candidates}. Do not rename endpoints as local, remote, side_a, or side_b. "
@@ -251,8 +322,24 @@ def stage1_prompt(summary: dict[str, Any]) -> str:
     )
 
 
-def stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
+def stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any], profile: str = "compact") -> str:
     candidates = ", ".join(summary["candidate_diagnoses"])
+    if profile == "local32b":
+        return (
+            "BiAn Stage 2: choose exactly one diagnosis for THIS case from: " + candidates + ". "
+            "Preserve native endpoint names; never output local, remote, side_a, or side_b. Compare each candidate "
+            "against the complete observed case, including directional Tx/Rx/transmission relationships, lane consistency, "
+            "missingness, status, alarm context, and contradictions. Interface/rate metadata is not a label. The expert "
+            "background is weak and may be wrong; observed evidence has priority and may override it. Do not force fiber "
+            "or use it as a default. Return ONLY the required JSON object, with concise one-sentence text fields, no markdown, "
+            "code fences, repeated input, chain-of-thought, or text outside JSON.\n"
+            "Use exactly these Stage 2 fields: candidate_comparison (candidate/supporting_observations/"
+            "contradictory_observations/unexplained_observations objects), diagnosis_root_cause, and reason.\n"
+            + SOP_SOFT_PRIOR + "\nSTAGE1_OBJECTIVE_EVIDENCE:\n"
+            + json.dumps(stage1, ensure_ascii=False, separators=(",", ":"))
+            + "\nOBSERVABLE_SUMMARY:\n"
+            + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        )
     return (
         "BiAn Stage 2: diagnose one root cause using native endpoint identity. "
         f"Candidate diagnoses for THIS case: {candidates}. Output exactly one listed candidate; never output another endpoint. "
@@ -265,15 +352,78 @@ def stage2_prompt(summary: dict[str, Any], stage1: dict[str, Any]) -> str:
     )
 
 
-def fallback_stage1(endpoints: tuple[str, ...]) -> dict[str, Any]:
+def fallback_stage1(endpoints: tuple[str, ...], profile: str = "compact") -> dict[str, Any]:
+    if profile == "local32b":
+        return {
+            "endpoints": list(endpoints), "endpoint_observations": [], "directional_links": [],
+            "cross_endpoint_comparison": "unavailable", "data_quality": "unavailable",
+            "notable_inconsistencies": [],
+        }
     return {
         "endpoints": list(endpoints), "endpoint_evidence": {endpoint: "unavailable" for endpoint in endpoints},
         "cross_endpoint_evidence": "unavailable", "fiber_evidence": "unavailable", "uncertainty": "unavailable",
     }
 
 
-def normalize_stage1(value: Any, endpoints: tuple[str, ...]) -> dict[str, Any]:
+def normalize_stage1(value: Any, endpoints: tuple[str, ...], profile: str = "compact") -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
+    if profile == "local32b":
+        endpoint_observations = value.get("endpoint_observations")
+        if not isinstance(endpoint_observations, list):
+            endpoint_facts = value.get("endpoint_facts")
+            endpoint_observations = [
+                {"endpoint": endpoint, "observations": str(endpoint_facts[endpoint])}
+                for endpoint in endpoints
+                if isinstance(endpoint_facts, dict) and endpoint in endpoint_facts
+            ]
+        else:
+            endpoint_observations = [
+                {
+                    "endpoint": item.get("endpoint"),
+                    "observations": str(item.get("observations", item.get("evidence", ""))),
+                }
+                for item in endpoint_observations
+                if isinstance(item, dict) and item.get("endpoint") in endpoints
+            ]
+
+        directional_links = value.get("directional_links")
+        if not isinstance(directional_links, list):
+            link_facts = value.get("directional_link_facts")
+            directional_links = [
+                {"direction": _canonical_direction(direction, endpoints), "observations": str(link_facts[direction])}
+                for direction in _expected_raw_directions(endpoints)
+                if isinstance(link_facts, dict) and direction in link_facts
+            ]
+        else:
+            directional_links = [
+                {
+                    "direction": _canonical_direction(item.get("direction"), endpoints),
+                    "observations": str(item.get("observations", item.get("evidence", ""))),
+                }
+                for item in directional_links
+                if isinstance(item, dict) and _canonical_direction(item.get("direction"), endpoints)
+            ]
+
+        cross = value.get("cross_endpoint_comparison", value.get("cross_endpoint_differences"))
+        quality = value.get("data_quality", value.get("missingness_and_inconsistencies"))
+        inconsistencies = value.get("notable_inconsistencies")
+        if not isinstance(inconsistencies, list):
+            if isinstance(inconsistencies, str):
+                inconsistencies = [inconsistencies]
+            elif isinstance(quality, str) and quality:
+                # Gemini's equivalent field combines data-quality and
+                # inconsistency text; retaining the same text is lossless.
+                inconsistencies = [quality]
+            else:
+                inconsistencies = []
+        return {
+            "endpoints": list(endpoints),
+            "endpoint_observations": endpoint_observations,
+            "directional_links": directional_links,
+            "cross_endpoint_comparison": str(cross or "unavailable"),
+            "data_quality": str(quality or "unavailable"),
+            "notable_inconsistencies": inconsistencies,
+        }
     raw_evidence = value.get("endpoint_evidence", {})
     evidence: dict[str, str] = {endpoint: "unavailable" for endpoint in endpoints}
     if isinstance(raw_evidence, dict):
@@ -293,9 +443,78 @@ def normalize_stage1(value: Any, endpoints: tuple[str, ...]) -> dict[str, Any]:
     }
 
 
-def normalize_stage2(value: Any, candidates: list[str], fallback: str) -> dict[str, Any]:
+def _expected_raw_directions(endpoints: tuple[str, ...]) -> list[str]:
+    return [f"{source}-{target}" for source in endpoints for target in endpoints if source != target]
+
+
+def _canonical_direction(direction: Any, endpoints: tuple[str, ...]) -> str | None:
+    if not isinstance(direction, str):
+        return None
+    for source in endpoints:
+        for target in endpoints:
+            if source == target:
+                continue
+            if direction in {f"{source}->{target}", f"{source}-{target}", f"{source}→{target}"}:
+                return f"{source}->{target}"
+    return None
+
+
+def _stage1_has_canonical_shape(value: dict[str, Any], endpoints: tuple[str, ...]) -> bool:
+    observations = value.get("endpoint_observations")
+    if isinstance(observations, list):
+        observed_endpoints = {item.get("endpoint") for item in observations if isinstance(item, dict)}
+        has_endpoints = set(endpoints) <= observed_endpoints
+    else:
+        facts = value.get("endpoint_facts")
+        has_endpoints = isinstance(facts, dict) and set(endpoints) <= set(facts)
+    links = value.get("directional_links")
+    if isinstance(links, list):
+        directions = {_canonical_direction(item.get("direction"), endpoints) for item in links if isinstance(item, dict)}
+    else:
+        facts = value.get("directional_link_facts")
+        directions = {_canonical_direction(item, endpoints) for item in facts} if isinstance(facts, dict) else set()
+    expected = {f"{source}->{target}" for source in endpoints for target in endpoints if source != target}
+    has_links = expected <= directions
+    has_cross = isinstance(value.get("cross_endpoint_comparison", value.get("cross_endpoint_differences")), str)
+    quality = value.get("data_quality", value.get("missingness_and_inconsistencies"))
+    has_quality = isinstance(quality, str)
+    has_notable = isinstance(value.get("notable_inconsistencies"), list) or isinstance(value.get("missingness_and_inconsistencies"), str)
+    return has_endpoints and has_links and has_cross and has_quality and has_notable
+
+
+def _stage2_diagnosis(value: dict[str, Any], candidates: list[str]) -> Any:
+    for key in ("diagnosis_root_cause", "root_cause", "diagnosis"):
+        if key in value:
+            return value[key]
+    return None
+
+
+def _canonical_comparisons(value: dict[str, Any], candidates: list[str]) -> list[dict[str, Any]] | None:
+    raw = value.get("candidate_comparison", value.get("candidate_comparisons", value.get("comparisons")))
+    if not isinstance(raw, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        candidate = item.get("candidate", item.get("diagnosis"))
+        supporting = item.get("supporting_observations", item.get("supporting", item.get("support")))
+        contradictory = item.get("contradictory_observations", item.get("contradictory", item.get("conflicts")))
+        unexplained = item.get("unexplained_observations", item.get("unexplained"))
+        if candidate not in candidates or not all(isinstance(text, str) for text in (supporting, contradictory, unexplained)):
+            return None
+        normalized.append({
+            "candidate": candidate,
+            "supporting_observations": supporting,
+            "contradictory_observations": contradictory,
+            "unexplained_observations": unexplained,
+        })
+    return normalized
+
+
+def normalize_stage2(value: Any, candidates: list[str], fallback: str, profile: str = "compact") -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
-    diagnosis = value.get("diagnosis_root_cause")
+    diagnosis = _stage2_diagnosis(value, candidates)
     if diagnosis not in candidates:
         diagnosis = fallback if fallback in candidates else candidates[0]
     confidence = value.get("confidence", 0.0)
@@ -308,21 +527,33 @@ def normalize_stage2(value: Any, candidates: list[str], fallback: str) -> dict[s
     if 1.0 < confidence <= 100.0:
         confidence /= 100.0
     confidence = min(1.0, max(0.0, confidence))
-    return {
-        "diagnosis_root_cause": diagnosis, "confidence": confidence,
-        "reason": str(value.get("reason", value.get("reasoning", "format fallback"))),
-    }
+    reason = value.get("reason", value.get("reasoning", value.get("rationale", value.get("explanation", "format fallback"))))
+    if profile == "local32b":
+        comparisons = _canonical_comparisons(value, candidates) or []
+        return {"candidate_comparison": comparisons, "diagnosis_root_cause": diagnosis, "reason": str(reason)}
+    return {"diagnosis_root_cause": diagnosis, "confidence": confidence, "reason": str(reason)}
 
 
-def valid_stage1(value: Any, endpoints: tuple[str, ...]) -> bool:
+def valid_stage1(value: Any, endpoints: tuple[str, ...], profile: str = "compact") -> bool:
     if not isinstance(value, dict):
         return False
+    if profile == "local32b":
+        return _stage1_has_canonical_shape(value, endpoints)
     evidence = value.get("endpoint_evidence")
     if isinstance(evidence, dict):
         return any(endpoint in evidence for endpoint in endpoints)
     if isinstance(evidence, list):
         return any(isinstance(item, dict) and item.get("endpoint") in endpoints for item in evidence)
     return False
+
+
+def valid_stage2(value: Any, candidates: list[str], profile: str = "compact") -> bool:
+    if not isinstance(value, dict) or _stage2_diagnosis(value, candidates) not in candidates:
+        return False
+    if profile != "local32b":
+        return True
+    reason = value.get("reason", value.get("reasoning", value.get("rationale", value.get("explanation"))))
+    return isinstance(reason, str) and _canonical_comparisons(value, candidates) is not None
 
 
 def truth_after_predictions(cases: list[dict[str, Any]]) -> dict[str, str]:
@@ -355,6 +586,134 @@ def score_frame(frame: pd.DataFrame) -> str:
     ]
     lines.extend(f"{label:>12}  " + "  ".join(f"{int(value):>6}" for value in row) for label, row in zip(labels, cm))
     return "\n".join(lines) + "\n"
+
+
+def _write_evaluation_reports(
+    output_dir: Path,
+    records: list[dict[str, Any]],
+    total_cases: int,
+    model: str,
+    base_url: str | None,
+) -> None:
+    failed = [record for record in records if record.get("status") != "SUCCESS"]
+    successful = total_cases - len(failed)
+    failed_path = output_dir / "failed_cases.json"
+    failed_path.write_text(json.dumps(failed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    coverage = successful / total_cases if total_cases else 0.0
+    lines = [
+        "BiAn API evaluation run",
+        f"Model: {model}",
+        f"Base URL: {base_url or ''}",
+        f"Test cases: {total_cases}",
+        f"Successful cases: {successful}",
+        f"Failed cases: {len(failed)}",
+        f"Coverage: {coverage:.6f}",
+        "Failed cases are not assigned fallback predictions and are excluded from score metrics.",
+        "Ground truth is read only after prediction processing is complete.",
+    ]
+    (output_dir / "run_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _ledger_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, int]:
+    return {
+        key: int(after.get(key, 0)) - int(before.get(key, 0))
+        for key in (
+            "calls", "input_tokens", "output_tokens", "total_tokens",
+            "cached_input_tokens", "reasoning_tokens", "unknown_usage_requests",
+        )
+    }
+
+
+def _process_case(
+    case: dict[str, Any],
+    summary: dict[str, Any],
+    eps: tuple[str, ...],
+    backend: OpenAIResponsesBackend,
+    debug_dir: Path | None,
+    stage1_max_output_tokens: int,
+    stage2_max_output_tokens: int,
+    schema_profile: str,
+) -> tuple[dict[str, Any], UsageLedger]:
+    """Run one case; Stage 2 remains ordered after Stage 1."""
+    ledger = UsageLedger()
+    case_started = time.monotonic()
+    candidates = [*eps, "fiber"]
+    stage1_before = dict(ledger.stages.get("stage1", {}))
+    stage1_started = time.monotonic()
+    first_response = backend.request_json(
+        stage1_prompt(summary, schema_profile), stage1_schema(eps, schema_profile), "stage1",
+        lambda value: valid_stage1(value, eps, schema_profile),
+        case_id=case["case_id"],
+        max_output_tokens=stage1_max_output_tokens,
+        ledger=ledger,
+    )
+    stage1_latency = time.monotonic() - stage1_started
+    stage1_after = dict(ledger.stages.get("stage1", {}))
+    _write_debug_response(debug_dir, f"{case['case_id']}_stage1", first_response.get("raw_text", ""))
+    stage1_delta = _ledger_delta(stage1_after, stage1_before)
+
+    if first_response["value"] is None:
+        return {
+            "case_id": case["case_id"], "endpoints": list(eps),
+            "status": "STAGE1_FAILED", "diagnosis_root_cause": None,
+            "stage1_attempt": first_response["attempt"], "stage2_attempt": 0,
+            "stage1_error": first_response["error"], "stage2_error": "not_run_due_stage1_failure",
+            "stage1_parsed": False, "stage2_parsed": False,
+            "stage1_input_tokens": stage1_delta["input_tokens"],
+            "stage1_output_tokens": stage1_delta["output_tokens"],
+            "stage2_input_tokens": 0, "stage2_output_tokens": 0,
+            "input_tokens": stage1_delta["input_tokens"],
+            "output_tokens": stage1_delta["output_tokens"],
+            "total_tokens": stage1_delta["total_tokens"],
+            "unknown_usage_requests": stage1_delta["unknown_usage_requests"],
+            "api_calls": stage1_delta["calls"],
+            "retries": max(0, stage1_delta["calls"] - 1),
+            "stage1_latency_seconds": round(stage1_latency, 3), "stage2_latency_seconds": 0.0,
+            "latency_seconds": round(time.monotonic() - case_started, 3),
+        }, ledger
+
+    first = normalize_stage1(first_response["value"], eps, schema_profile)
+    stage2_before = dict(ledger.stages.get("stage2", {}))
+    stage2_started = time.monotonic()
+    second_response = backend.request_json(
+        stage2_prompt(summary, first, schema_profile), stage2_schema(eps, schema_profile), "stage2",
+        lambda value: valid_stage2(value, candidates, schema_profile),
+        case_id=case["case_id"],
+        max_output_tokens=stage2_max_output_tokens,
+        ledger=ledger,
+    )
+    stage2_latency = time.monotonic() - stage2_started
+    stage2_after = dict(ledger.stages.get("stage2", {}))
+    _write_debug_response(debug_dir, f"{case['case_id']}_stage2", second_response.get("raw_text", ""))
+    stage2_delta = _ledger_delta(stage2_after, stage2_before)
+    second = normalize_stage2(second_response["value"], candidates, eps[0], schema_profile) if second_response["value"] is not None else None
+    if second is not None:
+        diagnosis = second["diagnosis_root_cause"]
+        status = "SUCCESS"
+    else:
+        diagnosis = None
+        status = "STAGE2_FAILED"
+    attempted_stages = 2
+    return {
+        "case_id": case["case_id"], "endpoints": list(eps),
+        "status": status, "diagnosis_root_cause": diagnosis,
+        "stage1_attempt": first_response["attempt"], "stage2_attempt": second_response["attempt"],
+        "stage1_error": first_response["error"], "stage2_error": second_response["error"],
+        "stage1_parsed": True, "stage2_parsed": second_response["value"] is not None,
+        "stage1_input_tokens": stage1_delta["input_tokens"],
+        "stage1_output_tokens": stage1_delta["output_tokens"],
+        "stage2_input_tokens": stage2_delta["input_tokens"],
+        "stage2_output_tokens": stage2_delta["output_tokens"],
+        "input_tokens": stage1_delta["input_tokens"] + stage2_delta["input_tokens"],
+        "output_tokens": stage1_delta["output_tokens"] + stage2_delta["output_tokens"],
+        "total_tokens": stage1_delta["total_tokens"] + stage2_delta["total_tokens"],
+        "unknown_usage_requests": stage1_delta["unknown_usage_requests"] + stage2_delta["unknown_usage_requests"],
+        "api_calls": stage1_delta["calls"] + stage2_delta["calls"],
+        "retries": max(0, stage1_delta["calls"] + stage2_delta["calls"] - attempted_stages),
+        "stage1_latency_seconds": round(stage1_latency, 3),
+        "stage2_latency_seconds": round(stage2_latency, 3),
+        "latency_seconds": round(time.monotonic() - case_started, 3),
+    }, ledger
 
 
 def load_split_ids(split_dir: Path, subset: str, all_case_ids: set[str]) -> set[str]:
@@ -514,11 +873,12 @@ def run(args: argparse.Namespace) -> int:
     if args.dry_run:
         rows = []
         for case, summary, eps in zip(cases, summaries, endpoints):
-            first = fallback_stage1(eps)
+            first = fallback_stage1(eps, args.schema_profile)
             rows.append({
                 "case_id": case["case_id"], "endpoints": list(eps),
-                "stage1_prompt_chars": len(stage1_prompt(summary)),
-                "stage2_prompt_chars": len(stage2_prompt(summary, first)),
+                "stage1_prompt_chars": len(stage1_prompt(summary, args.schema_profile)),
+                "stage2_prompt_chars": len(stage2_prompt(summary, first, args.schema_profile)),
+                "schema_profile": args.schema_profile,
                 "candidate_diagnoses": [*eps, "fiber"],
             })
         if args.limit is not None:
@@ -533,7 +893,22 @@ def run(args: argparse.Namespace) -> int:
         cases = cases[:args.limit]
         summaries = summaries[:args.limit]
         endpoints = endpoints[:args.limit]
-    records_path = args.output_dir / "api_records.jsonl"
+    if not 1 <= args.workers <= 3:
+        raise ValueError("--workers must be between 1 and 3")
+    shared_max = args.max_output_tokens
+    stage1_max_output_tokens = (
+        args.stage1_max_output_tokens if args.stage1_max_output_tokens is not None else shared_max
+    )
+    stage2_max_output_tokens = (
+        args.stage2_max_output_tokens if args.stage2_max_output_tokens is not None else shared_max
+    )
+    if stage1_max_output_tokens <= 0 or stage2_max_output_tokens <= 0:
+        raise ValueError("stage-specific max output tokens must be positive")
+    # The checkpoint is the canonical resumable record for each selected run.
+    # Keep legacy api_records.jsonl runs readable when explicitly resuming them.
+    records_path = args.output_dir / "checkpoint.jsonl"
+    if args.resume and not records_path.exists() and (args.output_dir / "api_records.jsonl").exists():
+        records_path = args.output_dir / "api_records.jsonl"
     resume_records = _read_resume(records_path) if args.resume else {}
     usage_path = args.output_dir / "token_usage.json"
     ledger = UsageLedger.from_dict(json.loads(usage_path.read_text(encoding="utf-8"))) if args.resume and usage_path.exists() else UsageLedger()
@@ -543,6 +918,7 @@ def run(args: argparse.Namespace) -> int:
         args.max_output_tokens,
         args.max_retries,
         args.reasoning_effort,
+        args.thinking,
         ledger,
         base_url=args.base_url,
         timeout_seconds=read_timeout,
@@ -551,11 +927,14 @@ def run(args: argparse.Namespace) -> int:
         write_timeout_seconds=args.write_timeout_seconds,
         pool_timeout_seconds=args.pool_timeout_seconds,
         request_log_path=args.output_dir / "request_log.jsonl",
+        request_start_interval_seconds=args.request_start_interval_seconds,
+        request_start_jitter_seconds=args.request_start_jitter_seconds,
+        structured_output_mode=args.structured_output,
     )
     predictions: dict[str, str] = {}
     normalized_records: list[dict[str, Any]] = []
+    pending: list[tuple[dict[str, Any], dict[str, Any], tuple[str, ...]]] = []
     for case, summary, eps in zip(cases, summaries, endpoints):
-        case_started = time.monotonic()
         candidates = [*eps, "fiber"]
         existing = resume_records.get(case["case_id"])
         if (
@@ -567,68 +946,37 @@ def run(args: argparse.Namespace) -> int:
             predictions[case["case_id"]] = existing["diagnosis_root_cause"]
             normalized_records.append(existing)
             continue
-        stage1_before = dict(ledger.stages.get("stage1", {}))
-        stage1_started = time.monotonic()
-        first_response = backend.request_json(
-            stage1_prompt(summary), stage1_schema(eps), "stage1",
-            lambda value: valid_stage1(value, eps),
-            case_id=case["case_id"],
-        )
-        stage1_latency = time.monotonic() - stage1_started
-        stage1_after = dict(ledger.stages.get("stage1", {}))
-        _write_debug_response(args.debug_dir, "stage1", first_response.get("raw_text", ""))
-        first = normalize_stage1(first_response["value"], eps) if first_response["value"] is not None else fallback_stage1(eps)
-        stage2_before = dict(ledger.stages.get("stage2", {}))
-        stage2_started = time.monotonic()
-        second_response = backend.request_json(
-            stage2_prompt(summary, first), stage2_schema(eps), "stage2",
-            lambda value: value.get("diagnosis_root_cause") in set(candidates),
-            case_id=case["case_id"],
-        )
-        stage2_latency = time.monotonic() - stage2_started
-        stage2_after = dict(ledger.stages.get("stage2", {}))
-        _write_debug_response(args.debug_dir, "stage2", second_response.get("raw_text", ""))
-        second = normalize_stage2(second_response["value"], candidates, eps[0])
-        predictions[case["case_id"]] = second["diagnosis_root_cause"]
-        stage1_delta = {key: stage1_after.get(key, 0) - stage1_before.get(key, 0) for key in
-                        ("calls", "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
-                         "reasoning_tokens", "unknown_usage_requests")}
-        stage2_delta = {key: stage2_after.get(key, 0) - stage2_before.get(key, 0) for key in
-                        ("calls", "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
-                         "reasoning_tokens", "unknown_usage_requests")}
-        # Retry counts are read after both stages; stage calls already include retries.
-        case_retry_calls = stage1_delta["calls"] + stage2_delta["calls"] - 2
-        if first_response["value"] is None:
-            case_status = "STAGE1_FAILED"
-        elif second_response["value"] is None:
-            case_status = "STAGE2_FAILED"
-        else:
-            case_status = "SUCCESS"
-        record = {
-            "case_id": case["case_id"], "endpoints": list(eps),
-            "status": case_status,
-            "diagnosis_root_cause": second["diagnosis_root_cause"],
-            "stage1_attempt": first_response["attempt"], "stage2_attempt": second_response["attempt"],
-            "stage1_error": first_response["error"], "stage2_error": second_response["error"],
-            "stage1_parsed": first_response["value"] is not None,
-            "stage2_parsed": second_response["value"] is not None,
-            "stage1_input_tokens": stage1_delta["input_tokens"],
-            "stage1_output_tokens": stage1_delta["output_tokens"],
-            "stage2_input_tokens": stage2_delta["input_tokens"],
-            "stage2_output_tokens": stage2_delta["output_tokens"],
-            "input_tokens": stage1_delta["input_tokens"] + stage2_delta["input_tokens"],
-            "output_tokens": stage1_delta["output_tokens"] + stage2_delta["output_tokens"],
-            "total_tokens": stage1_delta["total_tokens"] + stage2_delta["total_tokens"],
-            "unknown_usage_requests": stage1_delta["unknown_usage_requests"] + stage2_delta["unknown_usage_requests"],
-            "api_calls": stage1_delta["calls"] + stage2_delta["calls"],
-            "retries": max(0, case_retry_calls),
-            "stage1_latency_seconds": round(stage1_latency, 3),
-            "stage2_latency_seconds": round(stage2_latency, 3),
-            "latency_seconds": round(time.monotonic() - case_started, 3),
-        }
+        pending.append((case, summary, eps))
+
+    def persist_record(record: dict[str, Any], case_ledger: UsageLedger) -> None:
         normalized_records.append(record)
+        if record.get("status") == "SUCCESS" and isinstance(record.get("diagnosis_root_cause"), str):
+            predictions[record["case_id"]] = record["diagnosis_root_cause"]
+        ledger.merge(case_ledger)
         _append_record(records_path, record)
         _write_usage(args.output_dir, ledger, len(predictions))
+
+    if args.workers == 1:
+        for case, summary, eps in pending:
+            record, case_ledger = _process_case(
+                case, summary, eps, backend, args.debug_dir,
+                stage1_max_output_tokens, stage2_max_output_tokens,
+                args.schema_profile,
+            )
+            persist_record(record, case_ledger)
+    else:
+        # One client is initialized before worker creation; request/log and
+        # usage updates are protected inside the backend/ledger.
+        backend.client
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [executor.submit(
+                _process_case, case, summary, eps, backend, args.debug_dir,
+                stage1_max_output_tokens, stage2_max_output_tokens,
+                args.schema_profile,
+            ) for case, summary, eps in pending]
+            for future in as_completed(futures):
+                record, case_ledger = future.result()
+                persist_record(record, case_ledger)
 
     if args.no_evaluate:
         _write_usage(args.output_dir, ledger, len(predictions))
@@ -637,17 +985,23 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     # No ground truth is read until every prediction in this selected run is fixed.
-    truth = truth_after_predictions(cases)
+    # Failed cases intentionally have no prediction and are excluded from scoring.
+    successful_cases = [case for case in cases if case["case_id"] in predictions]
+    truth = truth_after_predictions(successful_cases)
     frame = pd.DataFrame({
-        "case_id": [case["case_id"] for case in cases],
-        "diagnosis_root_cause": [predictions[case["case_id"]] for case in cases],
-        "true_label": [truth[case["case_id"]] for case in cases],
+        "case_id": [case["case_id"] for case in successful_cases],
+        "diagnosis_root_cause": [predictions[case["case_id"]] for case in successful_cases],
+        "true_label": [truth[case["case_id"]] for case in successful_cases],
     })
-    if frame["case_id"].duplicated().any() or len(frame) != len(cases):
-        raise AssertionError("incomplete or duplicate API prediction set")
-    frame.to_csv(args.output_dir / "api_results.csv", index=False)
-    (args.output_dir / "scores.txt").write_text(score_frame(frame), encoding="utf-8")
+    if frame["case_id"].duplicated().any() or len(frame) != len(successful_cases):
+        raise AssertionError("duplicate API prediction set")
+    frame.to_csv(args.output_dir / args.results_name, index=False)
+    if len(frame):
+        (args.output_dir / "scores.txt").write_text(score_frame(frame), encoding="utf-8")
+    else:
+        (args.output_dir / "scores.txt").write_text("No successful predictions; scores unavailable.\n", encoding="utf-8")
     _write_usage(args.output_dir, ledger, len(predictions))
+    _write_evaluation_reports(args.output_dir, normalized_records, len(cases), args.model, args.base_url)
     print((args.output_dir / "scores.txt").read_text(encoding="utf-8"))
     return 0
 
@@ -660,18 +1014,34 @@ def main() -> int:
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"))
     parser.add_argument("--base-url", default=os.environ.get("CHATANYWHERE_BASE_URL") or os.environ.get("OPENAI_BASE_URL"))
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--max-output-tokens", type=int, default=256)
+    # Covers the largest successful default-thinking completion observed in
+    # the validated reliability run (Stage 1 max 7720; Stage 2 max 5383).
+    parser.add_argument("--max-output-tokens", type=int, default=8192)
+    parser.add_argument("--stage1-max-output-tokens", type=int)
+    parser.add_argument("--stage2-max-output-tokens", type=int)
     parser.add_argument("--timeout-seconds", type=float, help="legacy alias for read timeout")
     parser.add_argument("--connect-timeout-seconds", type=float, default=20.0)
     parser.add_argument("--read-timeout-seconds", type=float, default=150.0)
     parser.add_argument("--write-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--pool-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--request-start-interval-seconds", type=float, default=0.0,
+                        help="Minimum gap between shared-client request starts")
+    parser.add_argument("--request-start-jitter-seconds", type=float, default=0.0,
+                        help="Optional non-negative random pacing jitter")
     parser.add_argument("--debug-dir", type=Path)
+    parser.add_argument("--structured-output", choices=("prompt-json", "json-object"), default="json-object",
+                        help="Prompt-only JSON or provider json_object mode")
+    parser.add_argument("--schema-profile", choices=("compact", "local32b"), default="compact",
+                        help="Structured response fields; local32b mirrors the final local vLLM schema")
     parser.add_argument("--reasoning-effort")
+    parser.add_argument("--thinking", choices=("default", "disabled"), default="default",
+                        help="Optional provider-specific thinking mode; default omits the parameter")
     parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--workers", type=int, default=1, help="Sequential by default; supported range is 1..3")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--results-name", default="bian_results.csv")
     parser.add_argument("--no-evaluate", action="store_true", help="Do not reopen JSON labels or write an evaluated CSV")
     return run(parser.parse_args())
 

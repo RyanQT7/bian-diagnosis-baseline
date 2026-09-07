@@ -335,6 +335,7 @@ def run(args: argparse.Namespace) -> int:
         request_log_path=args.output_dir / "request_log.jsonl",
         request_start_interval_seconds=args.request_start_interval_seconds,
         request_start_jitter_seconds=args.request_start_jitter_seconds,
+        request_start_lock_path=args.request_start_lock_path,
         structured_output_mode=args.structured_output,
     )
 
@@ -410,6 +411,7 @@ def main() -> int:
     parser.add_argument("--pool-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--request-start-interval-seconds", type=float, default=0.0)
     parser.add_argument("--request-start-jitter-seconds", type=float, default=0.0)
+    parser.add_argument("--request-start-lock-path", type=Path)
     parser.add_argument("--debug-dir", type=Path)
     parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--resume", action="store_true")

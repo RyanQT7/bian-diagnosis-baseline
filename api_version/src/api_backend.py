@@ -7,6 +7,7 @@ import os
 import random
 import threading
 import time
+import fcntl
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,19 +176,53 @@ def _text_value(value: Any) -> str:
 
 
 class RequestStartLimiter:
-    """Serialize request starts with an optional minimum interval."""
+    """Serialize request starts with an optional process-shared interval."""
 
-    def __init__(self, interval_seconds: float = 0.0, jitter_seconds: float = 0.0) -> None:
+    def __init__(
+        self,
+        interval_seconds: float = 0.0,
+        jitter_seconds: float = 0.0,
+        lock_path: Path | None = None,
+    ) -> None:
         if interval_seconds < 0 or jitter_seconds < 0:
             raise ValueError("request pacing values must be non-negative")
         self.interval_seconds = float(interval_seconds)
         self.jitter_seconds = float(jitter_seconds)
+        self.lock_path = Path(lock_path) if lock_path else None
         self._lock = threading.Lock()
         self._next_allowed = 0.0
         self._random = random.Random(42)
 
     def wait(self) -> None:
         if self.interval_seconds <= 0:
+            return
+        if self.lock_path is not None:
+            # A file lock makes the start interval apply across independent
+            # shard processes, while keeping the normal in-process path cheap.
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.lock_path.open("a+", encoding="utf-8") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    stream.seek(0)
+                    text = stream.read().strip()
+                    try:
+                        last_start = float(text)
+                    except ValueError:
+                        last_start = 0.0
+                    gap = self.interval_seconds
+                    if self.jitter_seconds:
+                        gap += self._random.uniform(0.0, self.jitter_seconds)
+                    target = max(time.monotonic(), last_start + gap)
+                    delay = target - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    stream.seek(0)
+                    stream.truncate()
+                    stream.write(f"{time.monotonic():.9f}\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
             return
         # Holding the lock through the sleep makes the release immediately
         # precede the request start for the current worker.  Later workers
@@ -329,6 +364,7 @@ class OpenAIResponsesBackend:
         request_log_path: Path | None = None,
         request_start_interval_seconds: float = 0.0,
         request_start_jitter_seconds: float = 0.0,
+        request_start_lock_path: Path | None = None,
         structured_output_mode: str = "json-object",
     ) -> None:
         self.model = model
@@ -351,7 +387,9 @@ class OpenAIResponsesBackend:
         self.structured_output_mode = structured_output_mode
         self.request_log_path = request_log_path
         self._request_start_limiter = RequestStartLimiter(
-            request_start_interval_seconds, request_start_jitter_seconds
+            request_start_interval_seconds,
+            request_start_jitter_seconds,
+            request_start_lock_path,
         )
         self._client: Any = None
         self._client_lock = threading.Lock()

@@ -929,6 +929,7 @@ def run(args: argparse.Namespace) -> int:
         request_log_path=args.output_dir / "request_log.jsonl",
         request_start_interval_seconds=args.request_start_interval_seconds,
         request_start_jitter_seconds=args.request_start_jitter_seconds,
+        request_start_lock_path=args.request_start_lock_path,
         structured_output_mode=args.structured_output,
     )
     predictions: dict[str, str] = {}
@@ -1028,6 +1029,8 @@ def main() -> int:
                         help="Minimum gap between shared-client request starts")
     parser.add_argument("--request-start-jitter-seconds", type=float, default=0.0,
                         help="Optional non-negative random pacing jitter")
+    parser.add_argument("--request-start-lock-path", type=Path,
+                        help="Optional file lock for pacing across independent shard processes")
     parser.add_argument("--debug-dir", type=Path)
     parser.add_argument("--structured-output", choices=("prompt-json", "json-object"), default="json-object",
                         help="Prompt-only JSON or provider json_object mode")
